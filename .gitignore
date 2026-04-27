@@ -1,0 +1,21 @@
+# Virtual environment
+venv/
+env/
+.env
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Mac OS files
+.DS_Store
+
+# Large archives
+*.zip
+*.tar.gz
+*.rar
+Lưu trữ.zip
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/

@@ -1,0 +1,449 @@
+"""
+Training Script for Optimized DQN on 2048 Game
+================================================
+Default: Dueling Double DQN + CNN + PER + 3-step returns + Reward Shaping
+
+Usage:
+    # Default (recommended):
+    python training_dqn.py --episodes 50000
+
+    # Without PER and N-step (vanilla comparison):
+    python training_dqn.py --no-per --n-step 1 --no-reward-shaping
+
+    # Full 200K training:
+    python training_dqn.py --episodes 200000
+"""
+
+import numpy as np
+from game import Game
+from agent_dqn import DQNAgent, device
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import time
+import os
+import pickle
+import argparse
+
+
+# =============================================================================
+# State Transformation
+# =============================================================================
+def transform_state_cnn(state):
+    """Transform to CNN format: (18, 4, 4). Preserves 2D spatial structure."""
+    board = np.reshape(state, (4, 4)).copy()
+    board[board == 0] = 1
+    board = np.log2(board).astype(int)
+    one_hot = np.eye(18, dtype=np.float32)[board]
+    return np.transpose(one_hot, (2, 0, 1))
+
+
+def transform_state_flat(state, mode='one_hot'):
+    """Transform to flat format for MLP."""
+    state = np.reshape(state, -1).copy()
+    state[state == 0] = 1
+    if mode == 'log2':
+        return (np.log2(state) / 17.0).astype(np.float32)
+    else:
+        state = np.log2(state).astype(int)
+        return np.reshape(np.eye(18, dtype=np.float32)[state], -1)
+
+
+# =============================================================================
+# Reward Shaping (heuristic bonuses for 2048 strategy)
+# =============================================================================
+def get_potential(board):
+    """
+    Calculate the heuristic potential of a board state.
+    Used for Potential-Based Reward Shaping (PBRS).
+    R_shaped = R_raw + gamma * Phi(S') - Phi(S)
+    
+    This replaces the passive income of standard reward shaping
+    and mathematically guarantees that optimal policies remain unchanged.
+    """
+    b = board.reshape(4, 4)
+    max_val = b.max()
+    potential = 0.0
+
+    # 1. Corner potential (dynamic: +0.1 * log2(max_tile))
+    corners = [b[0, 0], b[0, 3], b[3, 0], b[3, 3]]
+    if max_val > 0 and max_val == max(corners):
+        potential += 0.1 * np.log2(max_val)
+
+    # 2. Empty cell potential (+0.02 per empty cell)
+    empty_count = np.sum(b == 0)
+    potential += empty_count * 0.02
+
+    # 3. Monotonicity potential (+0.25 per sorted edge)
+    log_b = np.log2(np.where(b > 0, b, 1))
+    for row in [log_b[0], log_b[3]]:
+        diffs = np.diff(row)
+        if np.all(diffs >= 0) or np.all(diffs <= 0):
+            potential += 0.25
+    for col_idx in [0, 3]:
+        col = log_b[:, col_idx]
+        diffs = np.diff(col)
+        if np.all(diffs >= 0) or np.all(diffs <= 0):
+            potential += 0.25
+
+    return potential
+
+
+# =============================================================================
+# Main Training Loop
+# =============================================================================
+def train(n_episodes=50000,
+          eps_start=1.0, eps_end=0.01, eps_decay=0.9995,
+          # Network
+          network_type='dueling_cnn', n_filters=64,
+          fc1=512, fc2=512, fc3=256,
+          # Hyperparameters
+          lr=1e-4, gamma=0.99, tau=1e-3,
+          buffer_size=200000, batch_size=256, update_every=4,
+          # Enhancements
+          double_dqn=True, use_per=True, n_step=3,
+          reward_shaping=True,
+          # Logging
+          save_every=1000, print_every=100,
+          save_name='optimized_dqn'):
+
+    # --- Environment ---
+    env = Game(4, reward_mode='log2', negative_reward=-2, cell_move_penalty=0.1)
+
+    # --- State transform ---
+    if network_type == 'dueling_cnn':
+        transform_fn = transform_state_cnn
+        state_size = 18 * 4 * 4
+    else:
+        transform_fn = lambda s: transform_state_flat(s, 'one_hot')
+        state_size = env.state_size * 18
+
+    # --- Banner ---
+    features = []
+    if double_dqn:
+        features.append("Double")
+    features.append("Dueling+CNN" if network_type == 'dueling_cnn' else "MLP")
+    if use_per:
+        features.append("PER")
+    if n_step > 1:
+        features.append(f"{n_step}-step")
+    if reward_shaping:
+        features.append("RewardShaping")
+    mode_name = " + ".join(features)
+
+    print("=" * 76)
+    print(f"  {mode_name} — TRAINING FOR 2048")
+    print("=" * 76)
+
+    # --- Create Agent ---
+    agent = DQNAgent(
+        state_size=state_size,
+        action_size=env.action_size,
+        seed=42,
+        network_type=network_type,
+        n_filters=n_filters,
+        fc1_units=fc1, fc2_units=fc2, fc3_units=fc3,
+        lr=lr, gamma=gamma, tau=tau,
+        buffer_size=buffer_size, batch_size=batch_size,
+        update_every=update_every,
+        double_dqn=double_dqn,
+        use_per=use_per,
+        n_step=n_step,
+    )
+
+    print(f"  Episodes        : {n_episodes:,}")
+    print(f"  Epsilon         : {eps_start:.2f} → {eps_end:.4f} (decay: {eps_decay})")
+    print(f"  Reward shaping  : {'ON' if reward_shaping else 'OFF'}")
+    print(f"  Device          : {device}")
+    print("=" * 76)
+
+    # --- Metrics ---
+    scores = []
+    max_tiles = []
+    total_rewards = []
+    steps_per_episode = []
+    tile_distribution = {}
+    best_score = 0
+    best_max_tile = 0
+    eps = eps_start
+
+    # =====================================================================
+    # TRAINING LOOP
+    # =====================================================================
+    for episode in range(1, n_episodes + 1):
+        t_start = time.time()
+        env.reset(2, 0)
+        state = transform_fn(env.current_state())
+        total_reward = 0
+        steps = 0
+
+        # Safety reset for n-step buffer to prevent memory leak across episodes
+        if agent.n_step_buffer is not None:
+            agent.n_step_buffer.reset()
+
+        invalid_move_count = 0
+        while not env.done:
+            action_values = agent.act(state, eps)
+
+            # Pure Epsilon-Greedy: Pick EXACTLY ONE action
+            if np.random.random() < eps:
+                action = int(np.random.randint(env.action_size))
+            else:
+                action = int(np.argmax(action_values[0]))
+
+            # Record potential before the move
+            phi_s = get_potential(env.game_board) if reward_shaping else 0.0
+
+            # Execute action
+            env.step(action)
+            next_state = transform_fn(env.current_state())
+            raw_reward = env.reward
+            done = env.done
+
+            if not env.moved:
+                # Invalid action penalty!
+                # State does not change, but agent receives a negative reward.
+                reward = -0.1
+                invalid_move_count += 1
+                
+                # Prevent infinite loops if the agent gets stuck picking invalid moves
+                if invalid_move_count >= 50:
+                    done = True
+                    reward = -5.0
+            else:
+                # Valid move
+                invalid_move_count = 0
+                total_reward += raw_reward
+                steps += 1
+                
+                # Potential-Based Reward Shaping
+                # phi_next = 0 if terminal state (creates natural death penalty)
+                phi_next_s = 0.0 if done else (get_potential(env.game_board) if reward_shaping else 0.0)
+                
+                if reward_shaping:
+                    reward = raw_reward + (gamma * phi_next_s) - phi_s
+                else:
+                    reward = raw_reward
+
+            # Push exactly what happened to replay buffer
+            agent.step(state, action, reward, next_state, done)
+            state = next_state
+            
+            if done:
+                break
+
+        t_elapsed = time.time() - t_start
+
+        # --- Record ---
+        score = env.score
+        max_tile = int(env.game_board.max())
+        scores.append(score)
+        max_tiles.append(max_tile)
+        total_rewards.append(total_reward)
+        steps_per_episode.append(steps)
+        tile_distribution[max_tile] = tile_distribution.get(max_tile, 0) + 1
+
+        if score > best_score:
+            best_score = score
+        if max_tile > best_max_tile:
+            best_max_tile = max_tile
+
+        eps = max(eps_end, eps * eps_decay)
+
+        # --- Print ---
+        if episode % print_every == 0:
+            n = min(print_every, len(scores))
+            avg_score = np.mean(scores[-n:])
+            avg_tile = np.mean(max_tiles[-n:])
+            avg_loss = np.mean(agent.losses[-1000:]) if agent.losses else 0
+            recent = max_tiles[-n:]
+            p256 = sum(1 for t in recent if t >= 256) / n * 100
+            p512 = sum(1 for t in recent if t >= 512) / n * 100
+            p1024 = sum(1 for t in recent if t >= 1024) / n * 100
+
+            print(
+                f"  Ep {episode:6,d} | "
+                f"Score:{avg_score:7.0f} | "
+                f"Tile:{avg_tile:5.0f} | "
+                f"Best:{best_max_tile:5d} | "
+                f"≥256:{p256:4.0f}% ≥512:{p512:3.0f}% ≥1K:{p1024:3.0f}% | "
+                f"ε:{eps:.4f} Loss:{avg_loss:.4f} | "
+                f"{t_elapsed:.2f}s"
+            )
+
+        if episode % save_every == 0:
+            _save_all(agent, save_name, scores, max_tiles,
+                      total_rewards, steps_per_episode, tile_distribution)
+            print(f"    → Saved at ep {episode:,d}")
+
+    # --- Final ---
+    _save_all(agent, save_name, scores, max_tiles,
+              total_rewards, steps_per_episode, tile_distribution)
+    plot_results(scores, max_tiles, total_rewards, agent.losses,
+                 tile_distribution, save_name)
+
+    print("=" * 76)
+    print("  TRAINING COMPLETE")
+    print(f"  Best Score: {best_score:,.0f}  |  Best Tile: {best_max_tile}")
+    for tile in sorted(tile_distribution.keys()):
+        count = tile_distribution[tile]
+        pct = count / n_episodes * 100
+        print(f"    {tile:6d}: {count:6d} ({pct:5.1f}%)")
+    print("=" * 76)
+
+    return agent, scores, max_tiles, total_rewards
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+def _save_all(agent, name, scores, max_tiles, rewards, steps, tile_dist):
+    agent.save(name)
+    os.makedirs('./data/', exist_ok=True)
+    with open(f'./data/metrics_{name}.pkl', 'wb') as f:
+        pickle.dump({
+            'scores': scores, 'max_tiles': max_tiles,
+            'total_rewards': rewards, 'steps_per_episode': steps,
+            'losses': agent.losses.copy(), 'tile_distribution': tile_dist,
+        }, f)
+
+
+def plot_results(scores, max_tiles, total_rewards, losses,
+                 tile_dist, save_name, window=200):
+    fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+    fig.suptitle('Optimized DQN Training — 2048', fontsize=14, fontweight='bold')
+
+    def _plot(ax, data, title, ylabel, color, w=window):
+        ax.plot(data, alpha=0.12, color=color)
+        if len(data) >= w:
+            ma = np.convolve(data, np.ones(w) / w, mode='valid')
+            ax.plot(range(w - 1, len(data)), ma, color=color, linewidth=2)
+        ax.set_title(title)
+        ax.set_xlabel('Episode')
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+
+    _plot(axes[0, 0], scores, 'Score', 'Score', '#2196F3')
+    _plot(axes[0, 1], max_tiles, 'Max Tile', 'Tile', '#4CAF50')
+    _plot(axes[0, 2], total_rewards, 'Total Reward', 'Reward', '#FF5722')
+
+    # Loss
+    ax = axes[1, 0]
+    if losses:
+        ax.plot(losses, alpha=0.1, color='#9C27B0')
+        wl = 2000
+        if len(losses) >= wl:
+            ma = np.convolve(losses, np.ones(wl) / wl, mode='valid')
+            ax.plot(range(wl - 1, len(losses)), ma, color='#9C27B0', linewidth=2)
+        ax.set_yscale('log')
+    ax.set_title('Loss (log)')
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+
+    # Tile distribution
+    ax = axes[1, 1]
+    if tile_dist:
+        tiles = sorted(tile_dist.keys())
+        total = sum(tile_dist.values())
+        pcts = [tile_dist[t] / total * 100 for t in tiles]
+        colors = ['#E0E0E0' if t < 256 else '#FFD54F' if t < 512
+                  else '#FF9800' if t < 1024 else '#F44336' if t < 2048
+                  else '#4CAF50' for t in tiles]
+        bars = ax.bar([str(t) for t in tiles], pcts, color=colors,
+                      edgecolor='#333', linewidth=0.5)
+        for bar, pct in zip(bars, pcts):
+            if pct > 1:
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                        f'{pct:.1f}%', ha='center', va='bottom', fontsize=8)
+    ax.set_title('Tile Distribution')
+    ax.set_xlabel('Tile')
+    ax.set_ylabel('% Games')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # Rolling avg max tile
+    ax = axes[1, 2]
+    if max_tiles:
+        rolling = [np.mean(max_tiles[max(0, i - window):i + 1])
+                   for i in range(len(max_tiles))]
+        ax.plot(rolling, color='#009688', linewidth=1.5)
+    ax.set_title('Rolling Avg Max Tile')
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Avg Tile')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = f'./data/{save_name}_results.png'
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Plot saved: {path}")
+
+
+# =============================================================================
+# Entry Point
+# =============================================================================
+if __name__ == '__main__':
+    p = argparse.ArgumentParser(
+        description='Train Optimized DQN for 2048',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # Training
+    p.add_argument('--episodes', type=int, default=50000)
+    p.add_argument('--eps-start', type=float, default=1.0)
+    p.add_argument('--eps-end', type=float, default=0.01)
+    p.add_argument('--eps-decay', type=float, default=0.9995)
+
+    # Network
+    p.add_argument('--network-type', default='dueling_cnn',
+                   choices=['dueling_cnn', 'mlp'])
+    p.add_argument('--n-filters', type=int, default=64)
+    p.add_argument('--fc1', type=int, default=512)
+    p.add_argument('--fc2', type=int, default=512)
+    p.add_argument('--fc3', type=int, default=256)
+
+    # Hyperparameters
+    p.add_argument('--lr', type=float, default=1e-4)
+    p.add_argument('--gamma', type=float, default=0.99)
+    p.add_argument('--tau', type=float, default=1e-3)
+    p.add_argument('--buffer-size', type=int, default=200000)
+    p.add_argument('--batch-size', type=int, default=256)
+    p.add_argument('--update-every', type=int, default=4)
+
+    # Enhancements
+    p.add_argument('--double-dqn', action='store_true', default=True)
+    p.add_argument('--no-double-dqn', action='store_true')
+    p.add_argument('--per', action='store_true', default=True,
+                   help='Use Prioritized Experience Replay')
+    p.add_argument('--no-per', action='store_true')
+    p.add_argument('--n-step', type=int, default=3,
+                   help='N-step returns (1=standard, 3=recommended)')
+    p.add_argument('--reward-shaping', action='store_true', default=True)
+    p.add_argument('--no-reward-shaping', action='store_true')
+
+    # Logging
+    p.add_argument('--save-every', type=int, default=1000)
+    p.add_argument('--print-every', type=int, default=100)
+    p.add_argument('--save-name', type=str, default='optimized_dqn')
+
+    args = p.parse_args()
+
+    train(
+        n_episodes=args.episodes,
+        eps_start=args.eps_start,
+        eps_end=args.eps_end,
+        eps_decay=args.eps_decay,
+        network_type=args.network_type,
+        n_filters=args.n_filters,
+        fc1=args.fc1, fc2=args.fc2, fc3=args.fc3,
+        lr=args.lr, gamma=args.gamma, tau=args.tau,
+        buffer_size=args.buffer_size,
+        batch_size=args.batch_size,
+        update_every=args.update_every,
+        double_dqn=args.double_dqn and not args.no_double_dqn,
+        use_per=args.per and not args.no_per,
+        n_step=args.n_step,
+        reward_shaping=args.reward_shaping and not args.no_reward_shaping,
+        save_every=args.save_every,
+        print_every=args.print_every,
+        save_name=args.save_name,
+    )
