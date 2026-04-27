@@ -1,4 +1,4 @@
-# 2048 Deep Reinforcement Learning Agent 🧠🎮
+# 2048 Deep Reinforcement Learning Agent 
 
 An advanced Deep Reinforcement Learning project that trains an AI agent to play the classic **2048 puzzle game**. 
 
@@ -6,7 +6,7 @@ This project evolved from a basic reward-prediction MLP into a **State-of-the-Ar
 
 ---
 
-## 🚀 Key Features & Architecture
+##  Key Features & Architecture
 
 To overcome the specific spatial challenges of the 2048 board and sparse long-term rewards, the agent implements several advanced techniques:
 
@@ -26,7 +26,7 @@ To overcome the specific spatial challenges of the 2048 board and sparse long-te
 
 ---
 
-## 🛠 Installation
+##  Installation
 
 Requirements: Python 3.8+
 
@@ -41,7 +41,7 @@ pip install numpy torch matplotlib
 
 ---
 
-## 🕹 Usage & Training
+##  Usage & Training
 
 The main training script is `training_dqn.py`. It is highly configurable via command-line arguments. 
 
@@ -72,7 +72,7 @@ python3 training_dqn.py --no-per --n-step 1
 
 ---
 
-## 📊 Outputs & Monitoring
+##  Outputs & Monitoring
 
 During training, the console will output progress every `100` episodes, showing the Average Score, Average Max Tile, Epsilon exploration rate, and the percentage of games reaching $\ge256$, $\ge512$, and $\ge1024$ tiles.
 
@@ -83,7 +83,7 @@ During training, the console will output progress every `100` episodes, showing 
 
 ---
 
-## 🧠 Project Structure
+##  Project Structure
 
 *   `game.py`: The 2048 environment logic and log2 raw reward calculation.
 *   `agent_dqn.py`: Contains the Replay Buffers (`SumTree`, `PER`, `NStepBuffer`) and the PyTorch Network definitions (`DuelingCNNNetwork`, `QNetwork`, `DQNAgent`).
