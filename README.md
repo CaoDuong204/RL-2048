@@ -1,4 +1,4 @@
-# 2048 Deep Reinforcement Learning Agent 🧠🎮
+# 2048 Deep Reinforcement Learning Agent 
 
 An advanced Deep Reinforcement Learning project that trains an AI agent to play the classic **2048 puzzle game**. 
 
@@ -6,7 +6,7 @@ This project evolved from a basic MLP into a **State-of-the-Art (SOTA) Dueling D
 
 ---
 
-## 🚀 Key Features & Architecture
+##  Key Features & Architecture
 
 To overcome the immense stochasticity (random tile spawns) and sparse rewards of 2048, this project implements a highly optimized RL pipeline:
 
@@ -30,7 +30,7 @@ To overcome the immense stochasticity (random tile spawns) and sparse rewards of
 
 ---
 
-## 🛠 Installation
+##  Installation
 
 Requirements: Python 3.8+, PyTorch 2.0+ (CUDA recommended)
 
@@ -45,7 +45,7 @@ pip install numpy torch matplotlib
 
 ---
 
-## 🕹 Usage & Training
+##  Usage & Training
 
 The main training script is `training_dqn.py`. It is highly configurable via command-line arguments. 
 
@@ -73,7 +73,7 @@ python3 training_dqn.py --network-type mlp --no-double-dqn --no-per --n-step 1
 
 ---
 
-## 📊 Outputs & Monitoring
+##  Outputs & Monitoring
 
 During training, the console will output progress every `100` episodes, showing the Average Score, Average Max Tile, Win Rates ($\ge512$, $\ge1024$), and Loss.
 
@@ -84,7 +84,7 @@ During training, the console will output progress every `100` episodes, showing 
 
 ---
 
-## 🧠 Project Structure
+##  Project Structure
 
 *   `game.py`: The 2048 environment logic, including optimized pure-numpy functions for Afterstate calculations.
 *   `agent_dqn.py`: Contains the `DQNAgent`, `AfterstateValueNetwork`, `NoisyLinear` layers, and Replay Buffers (`SumTree`, `PER`, `NStepBuffer`). Handles all PyTorch/GPU logic.
