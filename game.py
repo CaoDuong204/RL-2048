@@ -9,6 +9,96 @@ ACTION_RIGHT = 3
 
 base_dir = '.'
 
+
+# =============================================================================
+# Standalone Afterstate Computation (pure numpy, no Game instance needed)
+# =============================================================================
+def _shift_row(row):
+    """Shift non-zero elements to the left."""
+    result = np.zeros_like(row)
+    idx = 0
+    for v in row:
+        if v != 0:
+            result[idx] = v
+            idx += 1
+    return result
+
+
+def _merge_left(board):
+    """Apply left-merge to a 4x4 board. Returns (merged_board, log2_reward)."""
+    reward = 0.0
+    result = np.empty_like(board)
+    for i in range(board.shape[0]):
+        shifted = _shift_row(board[i])
+        for j in range(len(shifted) - 1):
+            if shifted[j] != 0 and shifted[j] == shifted[j + 1]:
+                shifted[j] *= 2
+                shifted[j + 1] = 0
+                reward += np.log2(shifted[j])
+        result[i] = _shift_row(shifted)
+    return result, reward
+
+
+def compute_afterstate(board_2d, action):
+    """
+    Compute afterstate for a given 4x4 board and action.
+    Pure numpy — no Game instance needed. Used during batch learning.
+    
+    Returns: (afterstate_2d, merge_reward, is_valid)
+    """
+    b = board_2d.copy()
+    if action == ACTION_LEFT:
+        b, reward = _merge_left(b)
+    elif action == ACTION_RIGHT:
+        b = np.flip(b, axis=1).copy()
+        b, reward = _merge_left(b)
+        b = np.flip(b, axis=1).copy()
+    elif action == ACTION_UP:
+        b = np.flip(np.transpose(b), axis=0).copy()
+        b, reward = _merge_left(b)
+        b = np.transpose(np.flip(b, axis=0)).copy()
+    elif action == ACTION_DOWN:
+        b = np.flip(np.transpose(b), axis=1).copy()
+        b, reward = _merge_left(b)
+        b = np.transpose(np.flip(b, axis=1)).copy()
+    else:
+        return board_2d.copy(), 0.0, False
+    is_valid = not np.array_equal(board_2d, b)
+    return b, reward, is_valid
+
+
+def decode_onehot_to_board(encoded):
+    """Decode (18, 4, 4) one-hot encoded state back to (4, 4) board."""
+    indices = np.argmax(encoded, axis=0)  # (4, 4) log2 values
+    board = np.power(2.0, indices)
+    board[indices == 0] = 0  # index 0 = empty cell
+    return board
+
+
+# =============================================================================
+# State Transformation (Moved from training_dqn.py to avoid circular import)
+# =============================================================================
+def transform_state_cnn(state):
+    """Transform to CNN format: (18, 4, 4). Preserves 2D spatial structure."""
+    board = np.reshape(state, (4, 4))
+    safe_board = np.where(board == 0, 1, board)
+    indices = np.where(board == 0, 0, np.log2(safe_board).astype(np.int32))
+    out = np.zeros((18, 4, 4), dtype=np.float32)
+    r, c = np.mgrid[0:4, 0:4]
+    out[indices, r, c] = 1.0
+    return out
+
+
+def transform_state_flat(state, mode='one_hot'):
+    """Transform to flat format for MLP."""
+    state = np.reshape(state, -1).copy()
+    state[state == 0] = 1
+    if mode == 'log2':
+        return (np.log2(state) / 17.0).astype(np.float32)
+    else:
+        state = np.log2(state).astype(int)
+        return np.reshape(np.eye(18, dtype=np.float32)[state], -1)
+
 class Game():
     """ 2048 game environment"""
     def __init__(self, size = 4, seed = 42, negative_reward = -10, reward_mode='log2', cell_move_penalty = 0.1):
@@ -158,30 +248,73 @@ class Game():
         return (self.game_board, self.reward, self.done)
 
     def virtual_step(self, action):
+        """
+        Simulate a step without modifying the internal state of the game.
+        Returns: (new_game_board, reward, done)
+        """
+        saved_reward = self.reward
+        saved_penalty = self.current_cell_move_penalty
+        temp_board = self.game_board.copy()
+
         if action == ACTION_LEFT:
-            new_game_board = self.calc_board(self.game_board.copy())
-
+            new_game_board = self.calc_board(temp_board)
         elif action == ACTION_RIGHT:
-            new_game_board = np.flip(self.calc_board(np.flip(self.game_board, axis=1)), axis=1)
-
+            new_game_board = np.flip(self.calc_board(np.flip(temp_board, axis=1)), axis=1)
         elif action == ACTION_UP:
             new_game_board = np.transpose(
-                np.flip(
-                    self.calc_board(np.flip(np.transpose(self.game_board), axis=0)), axis=0))
-
+                np.flip(self.calc_board(np.flip(np.transpose(temp_board), axis=0)), axis=0))
         elif action == ACTION_DOWN:
             new_game_board = np.transpose(
-                np.flip(
-                    self.calc_board(np.flip(np.transpose(self.game_board), axis=1)), axis=1))
+                np.flip(self.calc_board(np.flip(np.transpose(temp_board), axis=1)), axis=1))
         else: # just in case it happens
-            return (self.game_board, 0, self.done)
+            return (self.game_board.copy(), 0, self.done)
         
-        self.reward = self.reward - self.step_penalty
-        self.score = np.sum(self.game_board)
-        self.done = self.check_is_done(new_game_board)
-        return (new_game_board, self.reward, self.done)
-    
-    
+        step_reward = self.reward - self.step_penalty
+        
+        # Restore state mutated by calc_board
+        self.reward = saved_reward
+        self.current_cell_move_penalty = saved_penalty
+        
+        is_done = self.check_is_done(new_game_board)
+        return (new_game_board, step_reward, is_done)
+
+    def get_afterstate(self, action):
+        """
+        Compute afterstate WITHOUT modifying game state.
+        Returns (afterstate_board, merge_reward, is_valid).
+        
+        afterstate = board AFTER merge, BEFORE random tile spawn.
+        This is deterministic — no randomness involved.
+        """
+        saved_reward = self.reward
+        saved_penalty = self.current_cell_move_penalty
+        temp_board = self.game_board.copy()
+
+        if action == ACTION_LEFT:
+            result = self.calc_board(temp_board)
+        elif action == ACTION_RIGHT:
+            result = np.flip(self.calc_board(np.flip(temp_board, axis=1)), axis=1)
+        elif action == ACTION_UP:
+            result = np.transpose(
+                np.flip(
+                    self.calc_board(np.flip(np.transpose(temp_board), axis=0)), axis=0))
+        elif action == ACTION_DOWN:
+            result = np.transpose(
+                np.flip(
+                    self.calc_board(np.flip(np.transpose(temp_board), axis=1)), axis=1))
+        else:
+            return self.game_board.copy(), 0.0, False
+
+        merge_reward = self.reward
+        is_valid = not np.array_equal(self.game_board, result)
+
+        # Restore game state (calc_board modifies self.reward/penalty)
+        self.reward = saved_reward
+        self.current_cell_move_penalty = saved_penalty
+
+        return result, merge_reward, is_valid
+
+
     def check_is_done(self, board = None):
         """ Check if the game is over """
     

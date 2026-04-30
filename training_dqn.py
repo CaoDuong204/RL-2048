@@ -1,21 +1,23 @@
 """
 Training Script for Optimized DQN on 2048 Game
 ================================================
-Default: Dueling Double DQN + CNN + PER + 3-step returns + Reward Shaping
+Supports two modes:
+  1. Standard Q-learning (default, backward-compatible)
+  2. Afterstate V-learning + NoisyNet (--afterstate --noisy-net)
 
 Usage:
-    # Default (recommended):
+    # Default (original Dueling DDQN):
     python training_dqn.py --episodes 50000
 
-    # Without PER and N-step (vanilla comparison):
-    python training_dqn.py --no-per --n-step 1 --no-reward-shaping
+    # Afterstate + NoisyNet (recommended for 2048 tile):
+    python training_dqn.py --episodes 200000 --afterstate --noisy-net --lr-schedule
 
-    # Full 200K training:
-    python training_dqn.py --episodes 200000
+    # Vanilla DQN comparison:
+    python training_dqn.py --network-type mlp --no-double-dqn --no-per --n-step 1
 """
 
 import numpy as np
-from game import Game
+from game import Game, transform_state_cnn, transform_state_flat
 from agent_dqn import DQNAgent, device
 import matplotlib
 matplotlib.use('Agg')
@@ -25,28 +27,7 @@ import os
 import pickle
 import argparse
 
-
-# =============================================================================
-# State Transformation
-# =============================================================================
-def transform_state_cnn(state):
-    """Transform to CNN format: (18, 4, 4). Preserves 2D spatial structure."""
-    board = np.reshape(state, (4, 4)).copy()
-    board[board == 0] = 1
-    board = np.log2(board).astype(int)
-    one_hot = np.eye(18, dtype=np.float32)[board]
-    return np.transpose(one_hot, (2, 0, 1))
-
-
-def transform_state_flat(state, mode='one_hot'):
-    """Transform to flat format for MLP."""
-    state = np.reshape(state, -1).copy()
-    state[state == 0] = 1
-    if mode == 'log2':
-        return (np.log2(state) / 17.0).astype(np.float32)
-    else:
-        state = np.log2(state).astype(int)
-        return np.reshape(np.eye(18, dtype=np.float32)[state], -1)
+# State Transformation functions have been moved to game.py to prevent circular imports.
 
 
 # =============================================================================
@@ -103,6 +84,9 @@ def train(n_episodes=50000,
           # Enhancements
           double_dqn=True, use_per=True, n_step=3,
           reward_shaping=True,
+          # New features
+          afterstate=False, noisy_net=False, sigma_init=0.5,
+          lr_schedule=False,
           # Logging
           save_every=1000, print_every=100,
           save_name='optimized_dqn'):
@@ -111,7 +95,7 @@ def train(n_episodes=50000,
     env = Game(4, reward_mode='log2', negative_reward=-2, cell_move_penalty=0.1)
 
     # --- State transform ---
-    if network_type == 'dueling_cnn':
+    if network_type == 'dueling_cnn' or afterstate:
         transform_fn = transform_state_cnn
         state_size = 18 * 4 * 4
     else:
@@ -120,9 +104,16 @@ def train(n_episodes=50000,
 
     # --- Banner ---
     features = []
+    if afterstate:
+        features.append("Afterstate-V")
     if double_dqn:
         features.append("Double")
-    features.append("Dueling+CNN" if network_type == 'dueling_cnn' else "MLP")
+    if not afterstate:
+        features.append("Dueling+CNN" if network_type == 'dueling_cnn' else "MLP")
+    else:
+        features.append("CNN")
+    if noisy_net:
+        features.append("NoisyNet")
     if use_per:
         features.append("PER")
     if n_step > 1:
@@ -149,11 +140,27 @@ def train(n_episodes=50000,
         double_dqn=double_dqn,
         use_per=use_per,
         n_step=n_step,
+        afterstate=afterstate,
+        noisy_net=noisy_net,
+        sigma_init=sigma_init,
     )
 
+    # --- LR Scheduler ---
+    scheduler = None
+    if lr_schedule:
+        import torch
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            agent.optimizer, T_max=n_episodes, eta_min=1e-6
+        )
+        print(f"  LR Schedule    : CosineAnnealing → 1e-6")
+
     print(f"  Episodes        : {n_episodes:,}")
-    print(f"  Epsilon         : {eps_start:.2f} → {eps_end:.4f} (decay: {eps_decay})")
+    if not noisy_net:
+        print(f"  Epsilon         : {eps_start:.2f} → {eps_end:.4f} (decay: {eps_decay})")
+    else:
+        print(f"  Epsilon         : DISABLED (NoisyNet)")
     print(f"  Reward shaping  : {'ON' if reward_shaping else 'OFF'}")
+    print(f"  Afterstate      : {'ON' if afterstate else 'OFF'}")
     print(f"  Device          : {device}")
     print("=" * 76)
 
@@ -177,58 +184,109 @@ def train(n_episodes=50000,
         total_reward = 0
         steps = 0
 
-        # Safety reset for n-step buffer to prevent memory leak across episodes
+        # Safety reset for n-step buffer
         if agent.n_step_buffer is not None:
             agent.n_step_buffer.reset()
 
         invalid_move_count = 0
         while not env.done:
-            action_values = agent.act(state, eps)
 
-            # Pure Epsilon-Greedy: Pick EXACTLY ONE action
-            if np.random.random() < eps:
-                action = int(np.random.randint(env.action_size))
-            else:
-                action = int(np.argmax(action_values[0]))
+            # =============================================================
+            # ACTION SELECTION
+            # =============================================================
+            if afterstate:
+                # --- Afterstate mode: try all actions, pick best V ---
+                valid_actions = []
+                afterstate_tensors = []
+                for a in range(env.action_size):
+                    astate_board, merge_reward, is_valid = env.get_afterstate(a)
+                    if is_valid:
+                        valid_actions.append((a, merge_reward, astate_board))
+                        afterstate_tensors.append(
+                            transform_fn(astate_board.flatten()))
 
-            # Record potential before the move
-            phi_s = get_potential(env.game_board) if reward_shaping else 0.0
+                if not valid_actions:
+                    break  # No valid moves = game over
 
-            # Execute action
-            env.step(action)
-            next_state = transform_fn(env.current_state())
-            raw_reward = env.reward
-            done = env.done
+                # Evaluate all afterstates
+                values = agent.evaluate_batch(
+                    np.array(afterstate_tensors))  # (n_valid, 1)
 
-            if not env.moved:
-                # Invalid action penalty!
-                # State does not change, but agent receives a negative reward.
-                reward = -0.1
-                invalid_move_count += 1
-                
-                # Prevent infinite loops if the agent gets stuck picking invalid moves
-                if invalid_move_count >= 50:
-                    done = True
-                    reward = -5.0
-            else:
-                # Valid move
-                invalid_move_count = 0
+                # NoisyNet provides exploration via noise;
+                # otherwise use epsilon-greedy over afterstate values
+                if noisy_net or np.random.random() >= eps:
+                    best_idx = int(np.argmax(values))
+                else:
+                    best_idx = int(np.random.randint(len(valid_actions)))
+
+                action, merge_reward_val, chosen_astate = valid_actions[
+                    best_idx]
+                chosen_astate_encoded = afterstate_tensors[best_idx]
+
+                # Record potential before move
+                phi_s = get_potential(
+                    env.game_board) if reward_shaping else 0.0
+
+                # Execute action
+                env.step(action)
+                next_state = transform_fn(env.current_state())
+                done = env.done
+
+                # Reward = merge reward from afterstate computation
+                raw_reward = merge_reward_val
                 total_reward += raw_reward
                 steps += 1
-                
-                # Potential-Based Reward Shaping
-                # phi_next = 0 if terminal state (creates natural death penalty)
-                phi_next_s = 0.0 if done else (get_potential(env.game_board) if reward_shaping else 0.0)
-                
+
+                # PBRS
+                phi_next = 0.0 if done else (
+                    get_potential(env.game_board) if reward_shaping else 0.0)
                 if reward_shaping:
-                    reward = raw_reward + (gamma * phi_next_s) - phi_s
+                    reward = raw_reward + (gamma * phi_next) - phi_s
                 else:
                     reward = raw_reward
 
-            # Push exactly what happened to replay buffer
-            agent.step(state, action, reward, next_state, done)
-            state = next_state
-            
+                # Store (afterstate, dummy_action, reward, next_state, done)
+                agent.step(chosen_astate_encoded, 0, reward, next_state, done)
+                state = next_state
+
+            else:
+                # --- Standard Q-learning mode (original logic) ---
+                action_values = agent.act(state, eps)
+
+                if noisy_net or np.random.random() >= eps:
+                    action = int(np.argmax(action_values[0]))
+                else:
+                    action = int(np.random.randint(env.action_size))
+
+                phi_s = get_potential(
+                    env.game_board) if reward_shaping else 0.0
+
+                env.step(action)
+                next_state = transform_fn(env.current_state())
+                raw_reward = env.reward
+                done = env.done
+
+                if not env.moved:
+                    reward = -0.1
+                    invalid_move_count += 1
+                    if invalid_move_count >= 50:
+                        done = True
+                        reward = -5.0
+                else:
+                    invalid_move_count = 0
+                    total_reward += raw_reward
+                    steps += 1
+                    phi_next = 0.0 if done else (
+                        get_potential(
+                            env.game_board) if reward_shaping else 0.0)
+                    if reward_shaping:
+                        reward = raw_reward + (gamma * phi_next) - phi_s
+                    else:
+                        reward = raw_reward
+
+                agent.step(state, action, reward, next_state, done)
+                state = next_state
+
             if done:
                 break
 
@@ -247,8 +305,20 @@ def train(n_episodes=50000,
             best_score = score
         if max_tile > best_max_tile:
             best_max_tile = max_tile
+            agent.save(f'{save_name}_best')
+            print(f"    ★ New best tile: {best_max_tile}!")
 
-        eps = max(eps_end, eps * eps_decay)
+        # Epsilon decay (only when NOT using NoisyNet)
+        if not noisy_net:
+            eps = max(eps_end, eps * eps_decay)
+
+        # LR scheduler step
+        if scheduler is not None and agent.learn_step > 0:
+            scheduler.step()
+
+        # Hard target sync every 10K episodes
+        if episode % 10000 == 0:
+            agent._hard_update()
 
         # --- Print ---
         if episode % print_every == 0:
@@ -261,13 +331,14 @@ def train(n_episodes=50000,
             p512 = sum(1 for t in recent if t >= 512) / n * 100
             p1024 = sum(1 for t in recent if t >= 1024) / n * 100
 
+            lr_now = agent.optimizer.param_groups[0]['lr']
             print(
                 f"  Ep {episode:6,d} | "
                 f"Score:{avg_score:7.0f} | "
                 f"Tile:{avg_tile:5.0f} | "
                 f"Best:{best_max_tile:5d} | "
                 f"≥256:{p256:4.0f}% ≥512:{p512:3.0f}% ≥1K:{p1024:3.0f}% | "
-                f"ε:{eps:.4f} Loss:{avg_loss:.4f} | "
+                f"ε:{eps:.4f} Loss:{avg_loss:.4f} LR:{lr_now:.2e} | "
                 f"{t_elapsed:.2f}s"
             )
 
@@ -420,6 +491,16 @@ if __name__ == '__main__':
     p.add_argument('--reward-shaping', action='store_true', default=True)
     p.add_argument('--no-reward-shaping', action='store_true')
 
+    # New features
+    p.add_argument('--afterstate', action='store_true', default=False,
+                   help='Use afterstate V-learning (recommended for 2048)')
+    p.add_argument('--noisy-net', action='store_true', default=False,
+                   help='Use NoisyNet for exploration (replaces epsilon)')
+    p.add_argument('--sigma-init', type=float, default=0.5,
+                   help='NoisyNet initial sigma')
+    p.add_argument('--lr-schedule', action='store_true', default=False,
+                   help='Use cosine annealing LR scheduler')
+
     # Logging
     p.add_argument('--save-every', type=int, default=1000)
     p.add_argument('--print-every', type=int, default=100)
@@ -443,6 +524,10 @@ if __name__ == '__main__':
         use_per=args.per and not args.no_per,
         n_step=args.n_step,
         reward_shaping=args.reward_shaping and not args.no_reward_shaping,
+        afterstate=args.afterstate,
+        noisy_net=args.noisy_net,
+        sigma_init=args.sigma_init,
+        lr_schedule=args.lr_schedule,
         save_every=args.save_every,
         print_every=args.print_every,
         save_name=args.save_name,

@@ -34,6 +34,52 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 # =============================================================================
+# NoisyLinear Layer (Fortunato et al., 2017)
+# =============================================================================
+class NoisyLinear(nn.Module):
+    """Factored Gaussian Noisy Linear layer for learned exploration."""
+    def __init__(self, in_features, out_features, sigma_init=0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+        self.register_buffer('weight_epsilon', torch.empty(out_features, in_features))
+        self.register_buffer('bias_epsilon', torch.empty(out_features))
+        self.sigma_init = sigma_init
+        self.reset_parameters()
+        self.reset_noise()
+
+    def reset_parameters(self):
+        bound = 1 / self.in_features ** 0.5
+        self.weight_mu.data.uniform_(-bound, bound)
+        self.bias_mu.data.uniform_(-bound, bound)
+        self.weight_sigma.data.fill_(self.sigma_init / (self.in_features ** 0.5))
+        self.bias_sigma.data.fill_(self.sigma_init / (self.in_features ** 0.5))
+
+    def reset_noise(self):
+        eps_in = self._scale_noise(self.in_features)
+        eps_out = self._scale_noise(self.out_features)
+        self.weight_epsilon.copy_(eps_out.outer(eps_in))
+        self.bias_epsilon.copy_(eps_out)
+
+    @staticmethod
+    def _scale_noise(size):
+        x = torch.randn(size)
+        return x.sign() * x.abs().sqrt()
+
+    def forward(self, x):
+        if self.training:
+            w = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            b = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        else:
+            w, b = self.weight_mu, self.bias_mu
+        return F.linear(x, w, b)
+
+
+# =============================================================================
 # Network 1: Dueling CNN (recommended)
 # =============================================================================
 class DuelingCNNNetwork(nn.Module):
@@ -103,6 +149,53 @@ class DuelingCNNNetwork(nn.Module):
         a = self.advantage_out(a)
 
         return v + (a - a.mean(dim=1, keepdim=True))
+
+
+# =============================================================================
+# Network 3: Afterstate Value Network (V-learning)
+# =============================================================================
+class AfterstateValueNetwork(nn.Module):
+    """
+    V(afterstate) network for afterstate learning.
+    Same multi-scale CNN backbone as DuelingCNN.
+    Output: single scalar V (value of afterstate).
+    """
+    def __init__(self, seed, n_filters=64, noisy=False, sigma_init=0.5):
+        super().__init__()
+        torch.manual_seed(seed)
+        nf = n_filters
+        self.noisy = noisy
+
+        # CNN backbone (identical to DuelingCNNNetwork)
+        self.conv_2x2_a = nn.Conv2d(18, nf * 2, kernel_size=2)
+        self.conv_2x2_b = nn.Conv2d(nf * 2, nf * 2, kernel_size=2)
+        self.conv_row = nn.Conv2d(18, nf, kernel_size=(1, 4))
+        self.conv_col = nn.Conv2d(18, nf, kernel_size=(4, 1))
+        self.conv_3x3 = nn.Conv2d(18, nf, kernel_size=3)
+
+        flat_size = nf * 20
+        self.fc_shared = nn.Linear(flat_size, 256)
+
+        # Value head only (NoisyLinear if enabled)
+        Lin = lambda i, o: NoisyLinear(i, o, sigma_init) if noisy else nn.Linear(i, o)
+        self.value_fc = Lin(256, 128)
+        self.value_out = Lin(128, 1)
+
+    def reset_noise(self):
+        if self.noisy:
+            for m in self.modules():
+                if isinstance(m, NoisyLinear):
+                    m.reset_noise()
+
+    def forward(self, state):
+        x1 = F.relu(self.conv_2x2_a(state))
+        x1 = F.relu(self.conv_2x2_b(x1))
+        x1 = x1.reshape(x1.size(0), -1)
+        x2 = F.relu(self.conv_row(state)).reshape(state.size(0), -1)
+        x3 = F.relu(self.conv_col(state)).reshape(state.size(0), -1)
+        x4 = F.relu(self.conv_3x3(state)).reshape(state.size(0), -1)
+        x = F.relu(self.fc_shared(torch.cat([x1, x2, x3, x4], dim=1)))
+        return self.value_out(F.relu(self.value_fc(x)))
 
 
 # =============================================================================
@@ -362,19 +455,17 @@ class NStepBuffer:
 
 
 # =============================================================================
-# DQN Agent (Full-featured)
+# DQN Agent (Full-featured + Afterstate V-Learning)
 # =============================================================================
 class DQNAgent:
     """
     Optimized DQN Agent for 2048.
 
-    Features (all configurable):
-    - Dueling CNN or MLP network
-    - Double DQN
-    - Prioritized Experience Replay (PER)
-    - N-step returns
-    - Gradient clipping
-    - Soft target network updates
+    Modes:
+    - Q-learning (default): Q(s,a) with Dueling CNN
+    - Afterstate V-learning: V(afterstate) — learns board evaluation after merge
+    
+    Enhancements: Double DQN, PER, N-step, NoisyNet, AMP, gradient clipping.
     """
 
     def __init__(self, state_size=288, action_size=4, seed=42,
@@ -387,28 +478,16 @@ class DQNAgent:
                  # Enhancements
                  double_dqn=True,
                  use_per=True, per_alpha=0.5, per_beta_start=0.5,
-                 n_step=3):
-        """
-        Parameters
-        ----------
-        network_type : str    – 'dueling_cnn' or 'mlp'
-        n_filters : int       – CNN base filter count
-        lr : float            – Learning rate
-        gamma : float         – Discount factor
-        tau : float           – Soft update rate for target network
-        buffer_size : int     – Replay buffer capacity
-        batch_size : int      – Mini-batch size
-        update_every : int    – Learn every N agent steps
-        double_dqn : bool     – Use Double DQN
-        use_per : bool        – Use Prioritized Experience Replay
-        per_alpha : float     – PER prioritization exponent (0=uniform, 1=full)
-        per_beta_start : float – PER initial importance sampling correction
-        n_step : int          – N-step return (1=standard, 3=recommended)
-        """
+                 n_step=3,
+                 # New features
+                 afterstate=False, noisy_net=False, sigma_init=0.5):
+
         self.state_size = state_size
         self.action_size = action_size
         self.seed = seed
         self.network_type = network_type
+        self.afterstate = afterstate
+        self.noisy_net = noisy_net
         random.seed(seed)
         np.random.seed(seed)
 
@@ -421,7 +500,14 @@ class DQNAgent:
         self.n_step = n_step
 
         # === Networks ===
-        if network_type == 'dueling_cnn':
+        if afterstate:
+            self.qnetwork_local = AfterstateValueNetwork(
+                seed, n_filters, noisy=noisy_net, sigma_init=sigma_init
+            ).to(device)
+            self.qnetwork_target = AfterstateValueNetwork(
+                seed, n_filters, noisy=noisy_net, sigma_init=sigma_init
+            ).to(device)
+        elif network_type == 'dueling_cnn':
             self.qnetwork_local = DuelingCNNNetwork(action_size, seed, n_filters).to(device)
             self.qnetwork_target = DuelingCNNNetwork(action_size, seed, n_filters).to(device)
         else:
@@ -432,8 +518,20 @@ class DQNAgent:
                 state_size, action_size, seed, fc1_units, fc2_units, fc3_units
             ).to(device)
 
+        # torch.compile for GPU acceleration (PyTorch 2.0+)
+        if device.type == 'cuda' and hasattr(torch, 'compile'):
+            try:
+                self.qnetwork_local = torch.compile(self.qnetwork_local, mode='reduce-overhead')
+                self.qnetwork_target = torch.compile(self.qnetwork_target, mode='reduce-overhead')
+            except Exception:
+                pass  # Fallback if compile fails
+
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=lr)
         self._hard_update()
+
+        # === AMP ===
+        self.use_amp = (device.type == 'cuda')
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
         # === Replay Buffer ===
         if use_per:
@@ -455,9 +553,16 @@ class DQNAgent:
         # === Print summary ===
         total_params = sum(p.numel() for p in self.qnetwork_local.parameters())
         features = []
+        if afterstate:
+            features.append("Afterstate-V")
         if double_dqn:
             features.append("Double")
-        features.append("Dueling+CNN" if network_type == 'dueling_cnn' else "MLP")
+        if not afterstate:
+            features.append("Dueling+CNN" if network_type == 'dueling_cnn' else "MLP")
+        else:
+            features.append("CNN")
+        if noisy_net:
+            features.append("NoisyNet")
         if use_per:
             features.append("PER")
         if n_step > 1:
@@ -465,19 +570,18 @@ class DQNAgent:
         print(f"  Agent          : {' + '.join(features)}")
         print(f"  Parameters     : {total_params:,}")
         print(f"  Gamma^n_step   : {gamma}^{n_step} = {gamma**n_step:.6f}")
+        print(f"  AMP            : {'ON' if self.use_amp else 'OFF'}")
 
     # -----------------------------------------------------------------
     def step(self, state, action, reward, next_state, done):
         """Add experience (with n-step processing) and learn periodically."""
         if self.n_step_buffer is not None:
-            # N-step: accumulate transitions, compute multi-step returns
             transitions = self.n_step_buffer.add(
                 state, action, reward, next_state, done
             )
             for t in transitions:
                 self.memory.add(*t)
         else:
-            # Standard 1-step
             self.memory.add(state, action, reward, next_state, done)
 
         self.t_step += 1
@@ -487,76 +591,166 @@ class DQNAgent:
 
     # -----------------------------------------------------------------
     def act(self, state, eps=0.):
-        """Return Q-values for given state."""
+        """Return Q-values (or V-value for afterstate mode)."""
         state_t = torch.from_numpy(state).float().unsqueeze(0).to(device)
-        self.qnetwork_local.eval()
+        if self.noisy_net:
+            self.qnetwork_local.reset_noise()
         with torch.no_grad():
             q = self.qnetwork_local(state_t)
-        self.qnetwork_local.train()
         return q.cpu().data.numpy()
+
+    # -----------------------------------------------------------------
+    def evaluate_batch(self, states_np):
+        """Evaluate a batch of states. Returns numpy array of values."""
+        states_t = torch.from_numpy(states_np).float().to(device)
+        if self.noisy_net:
+            self.qnetwork_local.reset_noise()
+        with torch.no_grad():
+            v = self.qnetwork_local(states_t)
+        return v.cpu().numpy()
 
     # -----------------------------------------------------------------
     def _sample_and_learn(self):
         """Sample from buffer and learn."""
+        if self.noisy_net:
+            self.qnetwork_local.reset_noise()
+            self.qnetwork_target.reset_noise()
         result = self.memory.sample()
         if result is None:
             return
         experiences, indices, weights = result
-        self._learn(experiences, indices, weights)
+        if self.afterstate:
+            self._learn_afterstate(experiences, indices, weights)
+        else:
+            self._learn(experiences, indices, weights)
 
     # -----------------------------------------------------------------
     def _learn(self, experiences, indices=None, weights=None):
-        """
-        Update network using Bellman equation.
-
-        With N-step:  Q = R_n + γ^n * Q_target(s_{t+n})
-        With PER:     Loss weighted by importance sampling weights
-        With Double:  Action selected by local, evaluated by target
-        """
+        """Standard Q-learning update (unchanged from original)."""
         states, actions, rewards, next_states, dones = experiences
 
-        # --- Compute Q targets ---
         with torch.no_grad():
-            if self.double_dqn:
-                # Double DQN: local selects, target evaluates
-                best_actions = self.qnetwork_local(next_states).argmax(dim=1).unsqueeze(1)
-                Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)
-            else:
-                Q_targets_next = self.qnetwork_target(next_states).max(dim=1)[0].unsqueeze(1)
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                if self.double_dqn:
+                    best_actions = self.qnetwork_local(next_states).argmax(dim=1).unsqueeze(1)
+                    Q_targets_next = self.qnetwork_target(next_states).gather(1, best_actions)
+                else:
+                    Q_targets_next = self.qnetwork_target(next_states).max(dim=1)[0].unsqueeze(1)
 
-        # N-step Bellman: R_n + γ^n * Q_next * (1 - done)
         gamma_n = self.gamma ** self.n_step
         Q_targets = rewards + (gamma_n * Q_targets_next * (1.0 - dones))
 
-        # --- Compute Q expected ---
-        Q_expected = self.qnetwork_local(states).gather(1, actions)
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
+            Q_expected = self.qnetwork_local(states).gather(1, actions)
+            td_errors = (Q_expected - Q_targets).detach().float()
+            if weights is not None:
+                loss = (F.mse_loss(Q_expected, Q_targets, reduction='none') * weights).mean()
+            else:
+                loss = F.mse_loss(Q_expected, Q_targets)
 
-        # --- Compute loss ---
-        td_errors = (Q_expected - Q_targets).detach()
+        self._backward(loss)
 
-        if weights is not None:
-            # PER: weighted MSE loss (importance sampling correction)
-            element_wise_loss = F.mse_loss(Q_expected, Q_targets, reduction='none')
-            loss = (element_wise_loss * weights).mean()
-        else:
-            loss = F.mse_loss(Q_expected, Q_targets)
-
-        # --- Backward pass ---
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), 1.0)
-        self.optimizer.step()
-
-        # --- Update PER priorities ---
         if indices is not None:
-            td_np = td_errors.cpu().numpy().flatten()
-            self.memory.update_priorities(indices, td_np)
+            self.memory.update_priorities(indices, td_errors.cpu().numpy().flatten())
 
-        # --- Soft update target network ---
         self._soft_update()
-
         self.learn_step += 1
         self.losses.append(loss.item())
+
+    # -----------------------------------------------------------------
+    def _learn_afterstate(self, experiences, indices=None, weights=None):
+        """
+        Afterstate V-learning update.
+        
+        V(afterstate) → reward + γ^n * max_a V_target(afterstate(next_state, a))
+        
+        Key difference: must compute afterstates from next_states during learning.
+        """
+        from game import compute_afterstate, decode_onehot_to_board, transform_state_cnn
+
+        afterstates, _, rewards, next_states, dones = experiences
+
+        # --- Compute target: max_a V(afterstate(next_state, a)) ---
+        next_states_np = next_states.cpu().numpy()
+        batch_size = next_states_np.shape[0]
+        dones_np = dones.cpu().numpy().flatten()
+
+        # Decode one-hot → boards, compute all valid afterstates
+        all_afterstate_encoded = []
+        sample_map = []  # which sample each afterstate belongs to
+        for i in range(batch_size):
+            if dones_np[i]:
+                continue
+            board = decode_onehot_to_board(next_states_np[i])
+            for a in range(4):
+                astate, _, is_valid = compute_afterstate(board, a)
+                if is_valid:
+                    encoded = transform_state_cnn(astate.flatten())
+                    all_afterstate_encoded.append(encoded)
+                    sample_map.append(i)
+
+        # Batch evaluate all afterstates with target network
+        V_next_max = torch.zeros(batch_size, 1, device=device)
+        if all_afterstate_encoded:
+            all_tensor = torch.from_numpy(
+                np.array(all_afterstate_encoded)
+            ).float().to(device)
+
+            with torch.no_grad():
+                with torch.amp.autocast('cuda', enabled=self.use_amp):
+                    if self.double_dqn:
+                        local_vals = self.qnetwork_local(all_tensor).squeeze(1)
+                        target_vals = self.qnetwork_target(all_tensor).squeeze(1)
+                    else:
+                        target_vals = self.qnetwork_target(all_tensor).squeeze(1)
+
+            # Find max V per sample
+            if self.double_dqn:
+                # Double: local selects best, target evaluates it
+                best_per_sample = {}
+                for j, si in enumerate(sample_map):
+                    lv = local_vals[j].item()
+                    if si not in best_per_sample or lv > best_per_sample[si][1]:
+                        best_per_sample[si] = (j, lv)
+                for si, (j, _) in best_per_sample.items():
+                    V_next_max[si, 0] = target_vals[j]
+            else:
+                for j, si in enumerate(sample_map):
+                    tv = target_vals[j].item()
+                    if tv > V_next_max[si, 0].item():
+                        V_next_max[si, 0] = tv
+
+        # --- Compute targets ---
+        gamma_n = self.gamma ** self.n_step
+        V_targets = rewards + (gamma_n * V_next_max * (1.0 - dones))
+
+        # --- Forward pass on current afterstates ---
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
+            V_expected = self.qnetwork_local(afterstates)
+            td_errors = (V_expected - V_targets).detach().float()
+            if weights is not None:
+                loss = (F.mse_loss(V_expected, V_targets, reduction='none') * weights).mean()
+            else:
+                loss = F.mse_loss(V_expected, V_targets)
+
+        self._backward(loss)
+
+        if indices is not None:
+            self.memory.update_priorities(indices, td_errors.cpu().numpy().flatten())
+
+        self._soft_update()
+        self.learn_step += 1
+        self.losses.append(loss.item())
+
+    # -----------------------------------------------------------------
+    def _backward(self, loss):
+        """Backward pass with AMP support."""
+        self.optimizer.zero_grad(set_to_none=True)
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), 1.0)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
 
     # -----------------------------------------------------------------
     def _soft_update(self):
@@ -583,6 +777,7 @@ class DQNAgent:
             'learn_step': self.learn_step, 'network_type': self.network_type,
             'double_dqn': self.double_dqn, 'use_per': self.use_per,
             'n_step': self.n_step, 'gamma': self.gamma, 'tau': self.tau,
+            'afterstate': self.afterstate, 'noisy_net': self.noisy_net,
         }
         with open(os.path.join(save_dir, f'dqn_state_{name}.pkl'), 'wb') as f:
             pickle.dump(state, f)
@@ -599,3 +794,4 @@ class DQNAgent:
         self.losses = state['losses']
         self.t_step = state['t_step']
         self.learn_step = state['learn_step']
+
