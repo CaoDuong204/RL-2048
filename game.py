@@ -101,6 +101,49 @@ def transform_state_flat(state, mode='one_hot'):
         state = np.log2(state).astype(int)
         return np.reshape(np.eye(18, dtype=np.float32)[state], -1)
 
+_CALC_CACHE = {}
+
+def calc_row(row_tuple, reward_mode, cell_move_penalty):
+    key = (row_tuple, reward_mode, cell_move_penalty)
+    if key in _CALC_CACHE:
+        return _CALC_CACHE[key]
+    
+    r = list(row_tuple)
+    # shift 1
+    shifted1 = [0]*4
+    idx = 0
+    penalty1 = 0
+    for iv, v in enumerate(r):
+        if v != 0:
+            shifted1[idx] = v
+            if iv != idx: penalty1 += cell_move_penalty * v
+            idx += 1
+            
+    # merge
+    reward = 0
+    for i in range(3):
+        if shifted1[i] != 0 and shifted1[i] == shifted1[i+1]:
+            shifted1[i] *= 2
+            shifted1[i+1] = 0
+            if reward_mode == 'log2':
+                reward += np.log2(shifted1[i])
+            else:
+                reward += shifted1[i]
+                
+    # shift 2
+    shifted2 = [0]*4
+    idx = 0
+    penalty2 = 0
+    for iv, v in enumerate(shifted1):
+        if v != 0:
+            shifted2[idx] = v
+            if iv != idx: penalty2 += cell_move_penalty * v
+            idx += 1
+            
+    res = (tuple(shifted2), penalty1 + penalty2, reward)
+    _CALC_CACHE[key] = res
+    return res
+
 class Game():
     """ 2048 game environment"""
     def __init__(self, size = 4, seed = 42, negative_reward = -10, reward_mode='log2', cell_move_penalty = 0.1):
@@ -152,53 +195,6 @@ class Game():
             'score': self.score,
             'reward': self.reward
         })
-        
-_CALC_CACHE = {}
-
-def calc_row(row_tuple, reward_mode, cell_move_penalty):
-    key = (row_tuple, reward_mode, cell_move_penalty)
-    if key in _CALC_CACHE:
-        return _CALC_CACHE[key]
-    
-    r = list(row_tuple)
-    # shift 1
-    shifted1 = [0]*4
-    idx = 0
-    penalty1 = 0
-    for iv, v in enumerate(r):
-        if v != 0:
-            shifted1[idx] = v
-            if iv != idx: penalty1 += cell_move_penalty * v
-            idx += 1
-            
-    # merge
-    reward = 0
-    for i in range(3):
-        if shifted1[i] != 0 and shifted1[i] == shifted1[i+1]:
-            shifted1[i] *= 2
-            shifted1[i+1] = 0
-            if reward_mode == 'log2':
-                reward += np.log2(shifted1[i])
-            else:
-                reward += shifted1[i]
-                
-    # shift 2
-    shifted2 = [0]*4
-    idx = 0
-    penalty2 = 0
-    for iv, v in enumerate(shifted1):
-        if v != 0:
-            shifted2[idx] = v
-            if iv != idx: penalty2 += cell_move_penalty * v
-            idx += 1
-            
-    res = (tuple(shifted2), penalty1 + penalty2, reward)
-    _CALC_CACHE[key] = res
-    return res
-
-    def shift(self, board):
-        """ Deprecated by calc_row """
-        pass
         
     def calc_board(self, board):
         """ Calculate all cell mergers and return the new state of the board using fast cache"""
