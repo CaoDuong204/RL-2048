@@ -153,44 +153,65 @@ class Game():
             'reward': self.reward
         })
         
+_CALC_CACHE = {}
+
+def calc_row(row_tuple, reward_mode, cell_move_penalty):
+    key = (row_tuple, reward_mode, cell_move_penalty)
+    if key in _CALC_CACHE:
+        return _CALC_CACHE[key]
+    
+    r = list(row_tuple)
+    # shift 1
+    shifted1 = [0]*4
+    idx = 0
+    penalty1 = 0
+    for iv, v in enumerate(r):
+        if v != 0:
+            shifted1[idx] = v
+            if iv != idx: penalty1 += cell_move_penalty * v
+            idx += 1
+            
+    # merge
+    reward = 0
+    for i in range(3):
+        if shifted1[i] != 0 and shifted1[i] == shifted1[i+1]:
+            shifted1[i] *= 2
+            shifted1[i+1] = 0
+            if reward_mode == 'log2':
+                reward += np.log2(shifted1[i])
+            else:
+                reward += shifted1[i]
+                
+    # shift 2
+    shifted2 = [0]*4
+    idx = 0
+    penalty2 = 0
+    for iv, v in enumerate(shifted1):
+        if v != 0:
+            shifted2[idx] = v
+            if iv != idx: penalty2 += cell_move_penalty * v
+            idx += 1
+            
+    res = (tuple(shifted2), penalty1 + penalty2, reward)
+    _CALC_CACHE[key] = res
+    return res
+
     def shift(self, board):
-        """ Shifts all cells to the left and gathers penalties if needed """
-        shifted_board = np.empty((board.shape[0], board.shape[1]))
-        for i, row in enumerate(board):
-            shifted = np.zeros(len(row))
-            idx = 0
-            for iv, v in enumerate(row):
-                if v != 0:
-                    shifted[idx] = v
-                    if iv != idx:
-                        self.current_cell_move_penalty += self.cell_move_penalty * v
-                    idx += 1
-            shifted_board[i] = shifted
-        return shifted_board
+        """ Deprecated by calc_row """
+        pass
         
     def calc_board(self, board):
-        """ Calculate all cell mergers and return the new state of the board"""
-        
+        """ Calculate all cell mergers and return the new state of the board using fast cache"""
         self.reward = 0
         self.current_cell_move_penalty = 0
+        merged_board = np.empty_like(board)
         
-        shifted_board = self.shift(board)
-        
-        merged_board = np.empty((shifted_board.shape[0], shifted_board.shape[1]))
-        for idx, row in enumerate(shifted_board):
-            for i in range(len(row)-1):
-                if row[i] != 0 and row[i] == row[i+1]:
-                    
-                    row[i] = row[i] * 2
-                    row[i+1] = 0
-                    if self.reward_mode == 'log2':
-                        self.reward += np.log2(row[i])
-                    else:
-                        self.reward += row[i]
-
-            merged_board[idx] = row
-        merged_board = self.shift(merged_board)
-        
+        for i in range(board.shape[0]):
+            new_row, pen, rew = calc_row(tuple(board[i]), self.reward_mode, self.cell_move_penalty)
+            merged_board[i] = new_row
+            self.current_cell_move_penalty += pen
+            self.reward += rew
+            
         return merged_board
 
     def current_state(self):
