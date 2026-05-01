@@ -691,26 +691,29 @@ class DQNAgent:
             with torch.no_grad():
                 with torch.amp.autocast('cuda', enabled=self.use_amp):
                     if self.double_dqn:
-                        local_vals = self.qnetwork_local(all_tensor).squeeze(1)
-                        target_vals = self.qnetwork_target(all_tensor).squeeze(1)
+                        local_vals = self.qnetwork_local(all_tensor).squeeze(1).cpu().numpy()
+                        target_vals = self.qnetwork_target(all_tensor).squeeze(1).cpu().numpy()
                     else:
-                        target_vals = self.qnetwork_target(all_tensor).squeeze(1)
+                        target_vals = self.qnetwork_target(all_tensor).squeeze(1).cpu().numpy()
 
-            # Find max V per sample
+            # Find max V per sample on CPU to avoid massive GPU sync overhead
+            v_max_np = np.zeros((batch_size, 1), dtype=np.float32)
             if self.double_dqn:
                 # Double: local selects best, target evaluates it
                 best_per_sample = {}
                 for j, si in enumerate(sample_map):
-                    lv = local_vals[j].item()
+                    lv = local_vals[j]
                     if si not in best_per_sample or lv > best_per_sample[si][1]:
                         best_per_sample[si] = (j, lv)
                 for si, (j, _) in best_per_sample.items():
-                    V_next_max[si, 0] = target_vals[j]
+                    v_max_np[si, 0] = target_vals[j]
             else:
                 for j, si in enumerate(sample_map):
-                    tv = target_vals[j].item()
-                    if tv > V_next_max[si, 0].item():
-                        V_next_max[si, 0] = tv
+                    tv = target_vals[j]
+                    if tv > v_max_np[si, 0]:
+                        v_max_np[si, 0] = tv
+                        
+            V_next_max = torch.from_numpy(v_max_np).to(device)
 
         # --- Compute targets ---
         gamma_n = self.gamma ** self.n_step
