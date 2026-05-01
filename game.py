@@ -370,18 +370,13 @@ class Game():
     def fill_random_empty_cell(self, playing=True):
         """ Finds an empty cell and fills it with 2 or 4 with 90/10% probability respectively (as per game rules on Wikipedia) """
         
-        # If all cells are filled, there is no place to put a new value, just pass
-        if np.all(self.game_board):
+        # Fast sampling of empty cells to avoid rejection sampling bottleneck
+        empty_cells = np.argwhere(self.game_board == 0)
+        if len(empty_cells) == 0:
             return
         
-        # Pick the cell
-        x = np.random.randint(self.board_dim)
-        y = np.random.randint(self.board_dim)
-        
-        # Check if it is empty, otherwise pick a new one
-        while self.game_board[x, y] != 0:
-            x = np.random.randint(self.board_dim)
-            y = np.random.randint(self.board_dim)
+        chosen_idx = np.random.randint(len(empty_cells))
+        x, y = empty_cells[chosen_idx]
         
         # If it is a regular game, only values 2 and 4 are allowed
         if playing:

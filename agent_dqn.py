@@ -482,6 +482,9 @@ class DQNAgent:
                  n_step=3,
                  # New features
                  afterstate=False, noisy_net=False, sigma_init=0.5):
+                 
+        if afterstate:
+            n_step = 1  # Force n-step to 1 for afterstate to avoid mixing state spaces
 
         self.state_size = state_size
         self.action_size = action_size
