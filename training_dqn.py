@@ -187,6 +187,9 @@ def train(n_episodes=50000,
         # Safety reset for n-step buffer
         if agent.n_step_buffer is not None:
             agent.n_step_buffer.reset()
+            
+        if agent.noisy_net:
+            agent.qnetwork_local.reset_noise()
 
         invalid_move_count = 0
         while not env.done:

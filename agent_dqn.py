@@ -60,14 +60,15 @@ class NoisyLinear(nn.Module):
         self.bias_sigma.data.fill_(self.sigma_init / (self.in_features ** 0.5))
 
     def reset_noise(self):
-        eps_in = self._scale_noise(self.in_features)
-        eps_out = self._scale_noise(self.out_features)
+        device = self.weight_mu.device
+        eps_in = self._scale_noise(self.in_features, device)
+        eps_out = self._scale_noise(self.out_features, device)
         self.weight_epsilon.copy_(eps_out.outer(eps_in))
         self.bias_epsilon.copy_(eps_out)
 
     @staticmethod
-    def _scale_noise(size):
-        x = torch.randn(size)
+    def _scale_noise(size, device):
+        x = torch.randn(size, device=device)
         return x.sign() * x.abs().sqrt()
 
     def forward(self, x):
@@ -588,8 +589,6 @@ class DQNAgent:
     def act(self, state, eps=0.):
         """Return Q-values (or V-value for afterstate mode)."""
         state_t = torch.from_numpy(state).float().unsqueeze(0).to(device)
-        if self.noisy_net:
-            self.qnetwork_local.reset_noise()
         with torch.no_grad():
             q = self.qnetwork_local(state_t)
         return q.cpu().data.numpy()
@@ -598,8 +597,6 @@ class DQNAgent:
     def evaluate_batch(self, states_np):
         """Evaluate a batch of states. Returns numpy array of values."""
         states_t = torch.from_numpy(states_np).float().to(device)
-        if self.noisy_net:
-            self.qnetwork_local.reset_noise()
         with torch.no_grad():
             v = self.qnetwork_local(states_t)
         return v.cpu().numpy()
