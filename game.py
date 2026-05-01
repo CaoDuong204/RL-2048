@@ -78,14 +78,16 @@ def decode_onehot_to_board(encoded):
 # =============================================================================
 # State Transformation (Moved from training_dqn.py to avoid circular import)
 # =============================================================================
+_R_GRID, _C_GRID = np.mgrid[0:4, 0:4]
+
 def transform_state_cnn(state):
     """Transform to CNN format: (18, 4, 4). Preserves 2D spatial structure."""
     board = np.reshape(state, (4, 4))
-    safe_board = np.where(board == 0, 1, board)
-    indices = np.where(board == 0, 0, np.log2(safe_board).astype(np.int32))
+    indices = np.zeros((4, 4), dtype=np.int32)
+    mask = board > 0
+    indices[mask] = np.log2(board[mask]).astype(np.int32)
     out = np.zeros((18, 4, 4), dtype=np.float32)
-    r, c = np.mgrid[0:4, 0:4]
-    out[indices, r, c] = 1.0
+    out[indices, _R_GRID, _C_GRID] = 1.0
     return out
 
 

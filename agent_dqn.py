@@ -518,13 +518,8 @@ class DQNAgent:
                 state_size, action_size, seed, fc1_units, fc2_units, fc3_units
             ).to(device)
 
-        # torch.compile for GPU acceleration (PyTorch 2.0+)
-        if device.type == 'cuda' and hasattr(torch, 'compile'):
-            try:
-                self.qnetwork_local = torch.compile(self.qnetwork_local, mode='reduce-overhead')
-                self.qnetwork_target = torch.compile(self.qnetwork_target, mode='reduce-overhead')
-            except Exception:
-                pass  # Fallback if compile fails
+        # Removed torch.compile because it conflicts with CUDAGraphs and NoisyLinear,
+        # and it causes massive recompilation overhead for dynamic batch sizes (1-4).
 
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=lr)
         self._hard_update()
