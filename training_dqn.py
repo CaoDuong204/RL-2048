@@ -35,37 +35,41 @@ import argparse
 # =============================================================================
 def get_potential(board):
     """
-    Calculate the heuristic potential of a board state.
-    Used for Potential-Based Reward Shaping (PBRS).
-    R_shaped = R_raw + gamma * Phi(S') - Phi(S)
-    
-    This replaces the passive income of standard reward shaping
-    and mathematically guarantees that optimal policies remain unchanged.
+    Potential function for Reward Shaping.
+    Higher potential means a better board state.
     """
     b = board.reshape(4, 4)
     max_val = b.max()
     potential = 0.0
 
-    # 1. Corner potential (dynamic: +0.1 * log2(max_tile))
+    # 1. Corner potential (dynamic: +0.5 * log2(max_tile))
     corners = [b[0, 0], b[0, 3], b[3, 0], b[3, 3]]
     if max_val > 0 and max_val == max(corners):
-        potential += 0.1 * np.log2(max_val)
+        potential += 0.5 * np.log2(max_val)
 
-    # 2. Empty cell potential (+0.02 per empty cell)
+    # 2. Empty cell potential (+0.08 per empty cell)
     empty_count = np.sum(b == 0)
-    potential += empty_count * 0.02
+    potential += empty_count * 0.08
 
-    # 3. Monotonicity potential (+0.25 per sorted edge)
+    # 3. Monotonicity potential (+0.75 per sorted edge)
     log_b = np.log2(np.where(b > 0, b, 1))
     for row in [log_b[0], log_b[3]]:
         diffs = np.diff(row)
         if np.all(diffs >= 0) or np.all(diffs <= 0):
-            potential += 0.25
+            potential += 0.75
     for col_idx in [0, 3]:
         col = log_b[:, col_idx]
         diffs = np.diff(col)
         if np.all(diffs >= 0) or np.all(diffs <= 0):
-            potential += 0.25
+            potential += 0.75
+
+    # 4. Adjacent same-tile potential (snake strategy)
+    for i in range(4):
+        for j in range(3):
+            if b[i, j] > 0 and b[i, j] == b[i, j+1]:
+                potential += 0.2 * np.log2(b[i, j])
+            if b[j, i] > 0 and b[j, i] == b[j+1, i]:
+                potential += 0.2 * np.log2(b[j, i])
 
     return potential
 
@@ -74,7 +78,7 @@ def get_potential(board):
 # Main Training Loop
 # =============================================================================
 def train(n_episodes=50000,
-          eps_start=1.0, eps_end=0.01, eps_decay=0.9995,
+          eps_start=1.0, eps_end=0.05, eps_decay=0.9995,
           # Network
           network_type='dueling_cnn', n_filters=64,
           fc1=512, fc2=512, fc3=256,
@@ -91,8 +95,12 @@ def train(n_episodes=50000,
           save_every=1000, print_every=100,
           save_name='optimized_dqn'):
 
+    # Memory optimization for afterstate's 5D tensors
+    if afterstate and buffer_size > 100000:
+        buffer_size = 100000
+
     # --- Environment ---
-    env = Game(4, reward_mode='log2', negative_reward=-2, cell_move_penalty=0.1)
+    env = Game(4, reward_mode='log2', negative_reward=-5, cell_move_penalty=0.1)
 
     # --- State transform ---
     if network_type == 'dueling_cnn' or afterstate:
@@ -101,6 +109,26 @@ def train(n_episodes=50000,
     else:
         transform_fn = lambda s: transform_state_flat(s, 'one_hot')
         state_size = env.state_size * 18
+
+    # --- Create Agent (Early initialization to get true n_step) ---
+    agent = DQNAgent(
+        state_size=state_size,
+        action_size=env.action_size,
+        seed=42,
+        network_type=network_type,
+        n_filters=n_filters,
+        fc1_units=fc1, fc2_units=fc2, fc3_units=fc3,
+        lr=lr, gamma=gamma, tau=tau,
+        buffer_size=buffer_size, batch_size=batch_size,
+        update_every=update_every,
+        double_dqn=double_dqn,
+        use_per=use_per,
+        per_beta_frames=buffer_size, # beta reaches 1.0 after 1 buffer fill cycle
+        n_step=n_step,
+        afterstate=afterstate,
+        noisy_net=noisy_net,
+        sigma_init=sigma_init,
+    )
 
     # --- Banner ---
     features = []
@@ -116,8 +144,8 @@ def train(n_episodes=50000,
         features.append("NoisyNet")
     if use_per:
         features.append("PER")
-    if n_step > 1:
-        features.append(f"{n_step}-step")
+    if agent.n_step > 1:
+        features.append(f"{agent.n_step}-step")
     if reward_shaping:
         features.append("RewardShaping")
     mode_name = " + ".join(features)
@@ -125,25 +153,6 @@ def train(n_episodes=50000,
     print("=" * 76)
     print(f"  {mode_name} — TRAINING FOR 2048")
     print("=" * 76)
-
-    # --- Create Agent ---
-    agent = DQNAgent(
-        state_size=state_size,
-        action_size=env.action_size,
-        seed=42,
-        network_type=network_type,
-        n_filters=n_filters,
-        fc1_units=fc1, fc2_units=fc2, fc3_units=fc3,
-        lr=lr, gamma=gamma, tau=tau,
-        buffer_size=buffer_size, batch_size=batch_size,
-        update_every=update_every,
-        double_dqn=double_dqn,
-        use_per=use_per,
-        n_step=n_step,
-        afterstate=afterstate,
-        noisy_net=noisy_net,
-        sigma_init=sigma_init,
-    )
 
     # --- LR Scheduler ---
     scheduler = None
@@ -232,8 +241,18 @@ def train(n_episodes=50000,
 
                 # Execute action
                 env.step(action)
-                next_state = transform_fn(env.current_state())
                 done = env.done
+
+                # Precompute next afterstates to save CPU time during ReplayBuffer sample
+                if afterstate:
+                    next_state = np.zeros((4, 18, 4, 4), dtype=np.float32)
+                    if not done:
+                        for a in range(4):
+                            astate, _, is_valid = env.get_afterstate(a)
+                            if is_valid:
+                                next_state[a] = transform_fn(astate.flatten())
+                else:
+                    next_state = transform_fn(env.current_state())
 
                 # Reward = merge reward from afterstate computation
                 raw_reward = merge_reward_val
@@ -248,13 +267,16 @@ def train(n_episodes=50000,
                 else:
                     reward = raw_reward
 
-                # Store (afterstate, dummy_action, reward, next_state, done)
+                # Store (afterstate, dummy_action, reward, next_afterstates, done)
                 agent.step(chosen_astate_encoded, 0, reward, next_state, done)
-                state = next_state
+                if afterstate:
+                    state = transform_fn(env.current_state())
+                else:
+                    state = next_state
 
             else:
                 # --- Standard Q-learning mode (original logic) ---
-                action_values = agent.act(state, eps)
+                action_values = agent.act(state)
 
                 if noisy_net or np.random.random() >= eps:
                     action = int(np.argmax(action_values[0]))
@@ -272,7 +294,9 @@ def train(n_episodes=50000,
                 if not env.moved:
                     reward = -0.1
                     invalid_move_count += 1
-                    if invalid_move_count >= 50:
+                    if invalid_move_count >= 25:
+                        if agent.n_step_buffer is not None:
+                            agent.n_step_buffer.reset()
                         done = True
                         reward = -5.0
                 else:
@@ -319,9 +343,7 @@ def train(n_episodes=50000,
         if scheduler is not None and agent.learn_step > 0:
             scheduler.step()
 
-        # Hard target sync every 10K episodes
-        if episode % 10000 == 0:
-            agent._hard_update()
+        # Hard target sync removed: using soft update (tau) in _soft_update
 
         # --- Print ---
         if episode % print_every == 0:
@@ -464,7 +486,7 @@ if __name__ == '__main__':
     # Training
     p.add_argument('--episodes', type=int, default=50000)
     p.add_argument('--eps-start', type=float, default=1.0)
-    p.add_argument('--eps-end', type=float, default=0.01)
+    p.add_argument('--eps-end', type=float, default=0.05)
     p.add_argument('--eps-decay', type=float, default=0.9995)
 
     # Network

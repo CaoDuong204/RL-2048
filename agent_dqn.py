@@ -273,6 +273,38 @@ class SumTree:
         data_idx = leaf_idx - self.capacity + 1
         return leaf_idx, self.tree[leaf_idx], self.data[data_idx]
 
+    def get_batch(self, s_array):
+        """Vectorized retrieval of multiple samples."""
+        idx = np.zeros(len(s_array), dtype=int)
+        
+        # Array must be copied to avoid mutating the original input array view
+        s_array = np.array(s_array, copy=True)
+        
+        left_children = 2 * idx + 1
+        is_leaf = left_children >= len(self.tree)
+        
+        while not np.all(is_leaf):
+            not_leaf = ~is_leaf
+            curr_idx = idx[not_leaf]
+            curr_s = s_array[not_leaf]
+            
+            left = 2 * curr_idx + 1
+            left_vals = self.tree[left]
+            
+            go_left = curr_s <= left_vals
+            
+            new_idx = np.where(go_left, left, left + 1)
+            new_s = np.where(go_left, curr_s, curr_s - left_vals)
+            
+            idx[not_leaf] = new_idx
+            s_array[not_leaf] = new_s
+            
+            left_children = 2 * idx + 1
+            is_leaf = left_children >= len(self.tree)
+            
+        data_idx = idx - self.capacity + 1
+        return idx, self.tree[idx], [self.data[i] for i in data_idx]
+
     def update(self, tree_idx, priority):
         self._update(tree_idx, priority)
 
@@ -322,20 +354,22 @@ class PrioritizedReplayBuffer:
         )
         self.frame += 1
 
-        batch = []
-        indices = []
-        priorities = []
         segment = self.tree.total() / self.batch_size
 
-        for i in range(self.batch_size):
-            lo = segment * i
-            hi = segment * (i + 1)
-            s = np.random.uniform(lo, hi)
-            idx, priority, data = self.tree.get(s)
-            if data is not None:
-                batch.append(data)
-                indices.append(idx)
-                priorities.append(max(priority, self.epsilon))
+        # Vectorized sampling
+        a = segment * np.arange(self.batch_size)
+        b = segment * (np.arange(self.batch_size) + 1)
+        s_array = np.random.uniform(a, b)
+        
+        indices, priorities, batch = self.tree.get_batch(s_array)
+        
+        # Filter None
+        valid = [i for i, data in enumerate(batch) if data is not None]
+        batch = [batch[i] for i in valid]
+        indices = indices[valid]
+        priorities = priorities[valid]
+        
+        priorities = np.maximum(priorities, self.epsilon)
 
         if len(batch) < self.batch_size:
             return None
@@ -478,7 +512,7 @@ class DQNAgent:
                  buffer_size=200000, batch_size=256, update_every=4,
                  # Enhancements
                  double_dqn=True,
-                 use_per=True, per_alpha=0.5, per_beta_start=0.5,
+                 use_per=True, per_alpha=0.5, per_beta_start=0.5, per_beta_frames=200000,
                  n_step=3,
                  # New features
                  afterstate=False, noisy_net=False, sigma_init=0.5):
@@ -536,7 +570,7 @@ class DQNAgent:
         if use_per:
             self.memory = PrioritizedReplayBuffer(
                 buffer_size, batch_size,
-                alpha=per_alpha, beta_start=per_beta_start
+                alpha=per_alpha, beta_start=per_beta_start, beta_frames=per_beta_frames
             )
         else:
             self.memory = UniformReplayBuffer(buffer_size, batch_size, seed)
@@ -589,7 +623,7 @@ class DQNAgent:
                 self._sample_and_learn()
 
     # -----------------------------------------------------------------
-    def act(self, state, eps=0.):
+    def act(self, state):
         """Return Q-values (or V-value for afterstate mode)."""
         state_t = torch.from_numpy(state).float().unsqueeze(0).to(device)
         with torch.no_grad():
@@ -655,74 +689,44 @@ class DQNAgent:
     # -----------------------------------------------------------------
     def _learn_afterstate(self, experiences, indices=None, weights=None):
         """
-        Afterstate V-learning update.
+        Afterstate V-learning update using precomputed next afterstates.
         
         V(afterstate) → reward + γ^n * max_a V_target(afterstate(next_state, a))
-        
-        Key difference: must compute afterstates from next_states during learning.
         """
-        from game import compute_afterstate, decode_onehot_to_board, transform_state_cnn
+        afterstates, _, rewards, next_states_4, dones = experiences
+        # next_states_4 has shape (batch_size, 4, 18, 4, 4) due to precomputation in training_dqn.py
+        batch_size = afterstates.size(0)
+        
+        # Valid mask: since one-hot encoding means valid states have 1s, an all-zero tensor is invalid.
+        valid_mask = (next_states_4.sum(dim=(-3, -2, -1)) > 0) # shape (batch_size, 4)
+        
+        # Flatten to (batch_size * 4, 18, 4, 4) to process in one batch
+        # reshape() is safer than view() because the tensor may not be contiguous in memory
+        flat_next_states = next_states_4.reshape(batch_size * 4, 18, 4, 4)
+        
+        with torch.no_grad():
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                if self.double_dqn:
+                    local_vals = self.qnetwork_local(flat_next_states).view(batch_size, 4)
+                    target_vals = self.qnetwork_target(flat_next_states).view(batch_size, 4)
+                    
+                    # Mask out invalid actions by giving them -inf so they are never selected
+                    local_vals = local_vals.masked_fill(~valid_mask, float('-inf'))
+                    
+                    # Double DQN: local selects best action, target evaluates it
+                    best_actions = local_vals.argmax(dim=1, keepdim=True)
+                    V_next_max = target_vals.gather(1, best_actions)
+                else:
+                    target_vals = self.qnetwork_target(flat_next_states).view(batch_size, 4)
+                    target_vals = target_vals.masked_fill(~valid_mask, float('-inf'))
+                    V_next_max = target_vals.max(dim=1, keepdim=True)[0]
+                    
+        # Dones have 0 future value
+        V_next_max = V_next_max.masked_fill(dones.bool(), 0.0)
 
-        afterstates, _, rewards, next_states, dones = experiences
-
-        # --- Compute target: max_a V(afterstate(next_state, a)) ---
-        next_states_np = next_states.cpu().numpy()
-        batch_size = next_states_np.shape[0]
-        dones_np = dones.cpu().numpy().flatten()
-
-        # Decode one-hot → boards, compute all valid afterstates
-        all_afterstate_encoded = []
-        sample_map = []  # which sample each afterstate belongs to
-        for i in range(batch_size):
-            if dones_np[i]:
-                continue
-            board = decode_onehot_to_board(next_states_np[i])
-            for a in range(4):
-                astate, _, is_valid = compute_afterstate(board, a)
-                if is_valid:
-                    encoded = transform_state_cnn(astate.flatten())
-                    all_afterstate_encoded.append(encoded)
-                    sample_map.append(i)
-
-        # Batch evaluate all afterstates with target network
-        V_next_max = torch.zeros(batch_size, 1, device=device)
-        if all_afterstate_encoded:
-            all_tensor = torch.from_numpy(
-                np.array(all_afterstate_encoded)
-            ).float().to(device)
-
-            with torch.no_grad():
-                with torch.amp.autocast('cuda', enabled=self.use_amp):
-                    if self.double_dqn:
-                        local_vals = self.qnetwork_local(all_tensor).squeeze(1).cpu().numpy()
-                        target_vals = self.qnetwork_target(all_tensor).squeeze(1).cpu().numpy()
-                    else:
-                        target_vals = self.qnetwork_target(all_tensor).squeeze(1).cpu().numpy()
-
-            # Find max V per sample on CPU to avoid massive GPU sync overhead
-            v_max_np = np.zeros((batch_size, 1), dtype=np.float32)
-            if self.double_dqn:
-                # Double: local selects best, target evaluates it
-                best_per_sample = {}
-                for j, si in enumerate(sample_map):
-                    lv = local_vals[j]
-                    if si not in best_per_sample or lv > best_per_sample[si][1]:
-                        best_per_sample[si] = (j, lv)
-                for si, (j, _) in best_per_sample.items():
-                    v_max_np[si, 0] = target_vals[j]
-            else:
-                for j, si in enumerate(sample_map):
-                    tv = target_vals[j]
-                    if tv > v_max_np[si, 0]:
-                        v_max_np[si, 0] = tv
-                        
-            V_next_max = torch.from_numpy(v_max_np).to(device)
-
-        # --- Compute targets ---
         gamma_n = self.gamma ** self.n_step
-        V_targets = rewards + (gamma_n * V_next_max * (1.0 - dones))
+        V_targets = rewards + (gamma_n * V_next_max)
 
-        # --- Forward pass on current afterstates ---
         with torch.amp.autocast('cuda', enabled=self.use_amp):
             V_expected = self.qnetwork_local(afterstates)
             td_errors = (V_expected - V_targets).detach().float()
