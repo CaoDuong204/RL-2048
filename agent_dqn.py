@@ -78,6 +78,12 @@ class NoisyLinear(nn.Module):
             w, b = self.weight_mu, self.bias_mu
         return F.linear(x, w, b)
 
+    def decay_sigma(self, factor=0.999):
+        """Decay sigma parameters to reduce exploration over time."""
+        with torch.no_grad():
+            self.weight_sigma.mul_(factor)
+            self.bias_sigma.mul_(factor)
+
 
 # =============================================================================
 # Network 1: Dueling CNN (recommended)
@@ -196,6 +202,13 @@ class AfterstateValueNetwork(nn.Module):
         x4 = F.relu(self.conv_3x3(state)).reshape(state.size(0), -1)
         x = F.relu(self.fc_shared(torch.cat([x1, x2, x3, x4], dim=1)))
         return self.value_out(F.relu(self.value_fc(x)))
+
+    def decay_noise(self, factor=0.999):
+        """Decay sigma in all NoisyLinear layers to reduce exploration over time."""
+        if self.noisy:
+            for m in self.modules():
+                if isinstance(m, NoisyLinear):
+                    m.decay_sigma(factor)
 
 
 # =============================================================================
@@ -390,11 +403,10 @@ class PrioritizedReplayBuffer:
         return (states, actions, rewards, next_states, dones), indices, weights
 
     def update_priorities(self, indices, td_errors):
-        """Update priorities based on new TD errors."""
-        td_errors = np.clip(td_errors, -1.0, 1.0)
+        """Update priorities based on new TD errors. No hard clip — max_priority cap handles extremes."""
         for idx, td_error in zip(indices, td_errors):
             priority = (abs(td_error) + self.epsilon) ** self.alpha
-            self.max_priority = max(self.max_priority, priority)
+            self.max_priority = min(max(self.max_priority, priority), 100.0)  # Cap at 100
             self.tree.update(idx, priority)
 
     def __len__(self):
@@ -511,7 +523,7 @@ class DQNAgent:
                  buffer_size=200000, batch_size=256, update_every=4,
                  # Enhancements
                  double_dqn=True,
-                 use_per=True, per_alpha=0.5, per_beta_start=0.5, per_beta_frames=200000,
+                 use_per=True, per_alpha=0.5, per_beta_start=0.5, per_beta_frames=100000,
                  n_step=3,
                  # New features
                  afterstate=False, noisy_net=False, sigma_init=0.5):
