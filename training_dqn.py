@@ -288,6 +288,7 @@ def train(n_episodes=50000,
                 # Board 2048 has rotational symmetry: V(board) == V(rot(board))
                 # Action permutation: rot k*90° CCW maps action a → action (a+k)%4
                 # in the next_states_4 array, so we permute the action indices.
+                # Uses store_only() to avoid triggering 4x gradient updates.
                 _ROT_PERM = {1: [1, 2, 3, 0], 2: [2, 3, 0, 1], 3: [3, 0, 1, 2]}
                 for k in [1, 2, 3]:
                     aug_state = np.rot90(chosen_astate_encoded, k=k, axes=(-2, -1)).copy()
@@ -295,7 +296,7 @@ def train(n_episodes=50000,
                     aug_next = np.zeros_like(next_state)
                     for ai in range(4):
                         aug_next[ai] = np.rot90(next_state[perm[ai]], k=k, axes=(-2, -1))
-                    agent.step(aug_state, 0, reward, aug_next, done)
+                    agent.store_only(aug_state, 0, reward, aug_next, done)
 
                 if afterstate:
                     state = transform_fn(env.current_state())

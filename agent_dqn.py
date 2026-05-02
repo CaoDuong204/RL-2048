@@ -634,6 +634,12 @@ class DQNAgent:
                 self._sample_and_learn()
 
     # -----------------------------------------------------------------
+    def store_only(self, state, action, reward, next_state, done):
+        """Add experience to buffer WITHOUT triggering learning.
+        Used for data augmentation to avoid 4x gradient update overhead."""
+        self.memory.add(state, action, reward, next_state, done)
+
+    # -----------------------------------------------------------------
     def act(self, state):
         """Return Q-values (or V-value for afterstate mode)."""
         state_t = torch.from_numpy(state).float().unsqueeze(0).to(device)
