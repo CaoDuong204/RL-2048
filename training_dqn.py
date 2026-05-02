@@ -37,39 +37,49 @@ def get_potential(board):
     """
     Potential function for Reward Shaping.
     Higher potential means a better board state.
+    Coefficients reduced by 50% to prevent agent from over-fitting to heuristics
+    instead of learning true game value.
     """
     b = board.reshape(4, 4)
     max_val = b.max()
     potential = 0.0
 
-    # 1. Corner potential (dynamic: +0.5 * log2(max_tile))
+    # 1. Corner potential (dynamic: +0.25 * log2(max_tile))
     corners = [b[0, 0], b[0, 3], b[3, 0], b[3, 3]]
     if max_val > 0 and max_val == max(corners):
-        potential += 0.5 * np.log2(max_val)
+        potential += 0.25 * np.log2(max_val)
 
-    # 2. Empty cell potential (+0.08 per empty cell)
+    # 2. Empty cell potential (+0.04 per empty cell)
     empty_count = np.sum(b == 0)
-    potential += empty_count * 0.08
+    potential += empty_count * 0.04
 
-    # 3. Monotonicity potential (+0.75 per sorted edge)
+    # 3. Monotonicity potential (+0.4 per sorted edge)
     log_b = np.log2(np.where(b > 0, b, 1))
-    for row in [log_b[0], log_b[3]]:
+    for row in log_b:  # Check ALL rows, not just edges
         diffs = np.diff(row)
         if np.all(diffs >= 0) or np.all(diffs <= 0):
-            potential += 0.75
-    for col_idx in [0, 3]:
+            potential += 0.4
+    for col_idx in range(4):  # Check ALL columns
         col = log_b[:, col_idx]
         diffs = np.diff(col)
         if np.all(diffs >= 0) or np.all(diffs <= 0):
-            potential += 0.75
+            potential += 0.4
 
-    # 4. Adjacent same-tile potential (snake strategy)
+    # 4. Smoothness penalty (penalize large differences between adjacent tiles)
+    for i in range(4):
+        for j in range(3):
+            if b[i, j] > 0 and b[i, j+1] > 0:
+                potential -= 0.05 * abs(np.log2(b[i, j]) - np.log2(b[i, j+1]))
+            if b[j, i] > 0 and b[j+1, i] > 0:
+                potential -= 0.05 * abs(np.log2(b[j, i]) - np.log2(b[j+1, i]))
+
+    # 5. Adjacent same-tile potential (snake strategy, halved)
     for i in range(4):
         for j in range(3):
             if b[i, j] > 0 and b[i, j] == b[i, j+1]:
-                potential += 0.2 * np.log2(b[i, j])
+                potential += 0.1 * np.log2(b[i, j])
             if b[j, i] > 0 and b[j, i] == b[j+1, i]:
-                potential += 0.2 * np.log2(b[j, i])
+                potential += 0.1 * np.log2(b[j, i])
 
     return potential
 
@@ -159,9 +169,9 @@ def train(n_episodes=50000,
     if lr_schedule:
         import torch
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            agent.optimizer, T_max=n_episodes, eta_min=1e-6
+            agent.optimizer, T_max=n_episodes, eta_min=1e-5
         )
-        print(f"  LR Schedule    : CosineAnnealing → 1e-6")
+        print(f"  LR Schedule    : CosineAnnealing → 1e-5")
 
     print(f"  Episodes        : {n_episodes:,}")
     if not noisy_net:
@@ -262,6 +272,10 @@ def train(n_episodes=50000,
                 # PBRS
                 phi_next = 0.0 if done else (
                     get_potential(env.game_board) if reward_shaping else 0.0)
+                # Death penalty: teach agent that dying is catastrophic
+                if done:
+                    raw_reward -= 10.0
+
                 if reward_shaping:
                     reward = raw_reward + (gamma * phi_next) - phi_s
                 else:
@@ -269,6 +283,20 @@ def train(n_episodes=50000,
 
                 # Store (afterstate, dummy_action, reward, next_afterstates, done)
                 agent.step(chosen_astate_encoded, 0, reward, next_state, done)
+
+                # --- Data Augmentation: 3 rotations (90°, 180°, 270°) ---
+                # Board 2048 has rotational symmetry: V(board) == V(rot(board))
+                # Action permutation: rot k*90° CCW maps action a → action (a+k)%4
+                # in the next_states_4 array, so we permute the action indices.
+                _ROT_PERM = {1: [1, 2, 3, 0], 2: [2, 3, 0, 1], 3: [3, 0, 1, 2]}
+                for k in [1, 2, 3]:
+                    aug_state = np.rot90(chosen_astate_encoded, k=k, axes=(-2, -1)).copy()
+                    perm = _ROT_PERM[k]
+                    aug_next = np.zeros_like(next_state)
+                    for ai in range(4):
+                        aug_next[ai] = np.rot90(next_state[perm[ai]], k=k, axes=(-2, -1))
+                    agent.step(aug_state, 0, reward, aug_next, done)
+
                 if afterstate:
                     state = transform_fn(env.current_state())
                 else:
@@ -338,6 +366,11 @@ def train(n_episodes=50000,
         # Epsilon decay (only when NOT using NoisyNet)
         if not noisy_net:
             eps = max(eps_end, eps * eps_decay)
+        else:
+            # NoisyNet sigma decay: gradually reduce exploration
+            if hasattr(agent.qnetwork_local, 'decay_noise'):
+                agent.qnetwork_local.decay_noise(factor=0.9999)
+                agent.qnetwork_target.decay_noise(factor=0.9999)
 
         # LR scheduler step
         if scheduler is not None and agent.learn_step > 0:
@@ -350,20 +383,24 @@ def train(n_episodes=50000,
             n = min(print_every, len(scores))
             avg_score = np.mean(scores[-n:])
             avg_tile = np.mean(max_tiles[-n:])
+            med_tile = int(np.median(max_tiles[-n:]))
+            std_tile = np.std(max_tiles[-n:])
             avg_loss = np.mean(agent.losses[-1000:]) if agent.losses else 0
             recent = max_tiles[-n:]
             p256 = sum(1 for t in recent if t >= 256) / n * 100
             p512 = sum(1 for t in recent if t >= 512) / n * 100
             p1024 = sum(1 for t in recent if t >= 1024) / n * 100
+            p2048 = sum(1 for t in recent if t >= 2048) / n * 100
+            fail = sum(1 for t in recent if t < 256) / n * 100
 
             lr_now = agent.optimizer.param_groups[0]['lr']
             print(
                 f"  Ep {episode:6,d} | "
                 f"Score:{avg_score:7.0f} | "
-                f"Tile:{avg_tile:5.0f} | "
-                f"Best:{best_max_tile:5d} | "
-                f"≥256:{p256:4.0f}% ≥512:{p512:3.0f}% ≥1K:{p1024:3.0f}% | "
-                f"ε:{eps:.4f} Loss:{avg_loss:.4f} LR:{lr_now:.2e} | "
+                f"AvgTile:{avg_tile:5.0f} | Med:{med_tile:5d} | Std:{std_tile:5.0f} | "
+                f"≥256:{p256:3.0f}% ≥512:{p512:3.0f}% ≥1K:{p1024:3.0f}% ≥2K:{p2048:3.0f}% | "
+                f"Fail<256:{fail:3.0f}% | "
+                f"Loss:{avg_loss:.4f} | LR:{lr_now:.2e} | "
                 f"{t_elapsed:.2f}s"
             )
 
@@ -371,6 +408,49 @@ def train(n_episodes=50000,
             _save_all(agent, save_name, scores, max_tiles,
                       total_rewards, steps_per_episode, tile_distribution)
             print(f"    → Saved at ep {episode:,d}")
+
+        # --- Greedy Evaluation (no noise) every 1000 episodes ---
+        if episode % 1000 == 0:
+            eval_tiles = []
+            eval_scores_list = []
+            was_training = agent.qnetwork_local.training
+            agent.qnetwork_local.eval()  # Disables noise in NoisyLinear
+            for _ in range(200):
+                eval_env = Game(4, reward_mode='log2', negative_reward=-5, cell_move_penalty=0.1)
+                eval_env.reset(2, 0)
+                while not eval_env.done:
+                    if afterstate:
+                        va = []
+                        at = []
+                        for a_ev in range(eval_env.action_size):
+                            as_b, _, is_v = eval_env.get_afterstate(a_ev)
+                            if is_v:
+                                va.append(a_ev)
+                                at.append(transform_fn(as_b.flatten()))
+                        if not va:
+                            break
+                        vals = agent.evaluate_batch(np.array(at))
+                        best_a = va[int(np.argmax(vals))]
+                    else:
+                        av = agent.act(transform_fn(eval_env.current_state()))
+                        best_a = int(np.argmax(av[0]))
+                    eval_env.step(best_a)
+                eval_tiles.append(int(eval_env.game_board.max()))
+                eval_scores_list.append(eval_env.score)
+            agent.qnetwork_local.train(was_training)
+            e_avg = np.mean(eval_tiles)
+            e_med = int(np.median(eval_tiles))
+            e_std = np.std(eval_tiles)
+            e512 = sum(1 for t in eval_tiles if t >= 512) / len(eval_tiles) * 100
+            e1024 = sum(1 for t in eval_tiles if t >= 1024) / len(eval_tiles) * 100
+            e2048 = sum(1 for t in eval_tiles if t >= 2048) / len(eval_tiles) * 100
+            e_best = max(eval_tiles)
+            avg_eval = np.mean(eval_scores_list)
+            print(f"    ┌─ [EVAL - 200 games, greedy]")
+            print(f"    │  Score:{avg_eval:7.0f} | "
+                  f"AvgTile:{e_avg:5.0f} | Med:{e_med:5d} | Std:{e_std:5.0f}")
+            print(f"    │  ≥512:{e512:3.0f}% | ≥1024:{e1024:3.0f}% | ≥2048:{e2048:3.0f}%")
+            print(f"    └─ Best: {e_best}")
 
     # --- Final ---
     _save_all(agent, save_name, scores, max_tiles,
