@@ -38,8 +38,15 @@ To overcome the immense stochasticity (random tile spawns) and sparse rewards of
     *   **Empty cell bonus** (+0.04 per empty cell)
 *   **Death Penalty (-10):** Applied when the game ends in afterstate mode. Forces the agent to prioritize survival in late-game scenarios where the board is nearly full.
 
-### 6. Performance Optimizations
+### 6. Early Stopping
+*   **Composite Metric:** `eval_metric = ≥1024% × 0.6 + ≥2048% × 0.4`. Evaluated every 1000 episodes via 200 greedy games (no noise).
+*   **Patience:** Training stops if the metric doesn't improve by ≥1% for `patience` consecutive evaluations (default: 5 = 5000 episodes of no progress).
+*   **Min Episodes:** Early stopping only activates after `min_episodes` (default: 3000) to let the agent warm up.
+*   **Best Model Saved:** The eval-best checkpoint (`_eval_best.pth`) is saved whenever the metric improves — so you always keep the strongest model regardless of when training stops.
+
+### 7. Performance Optimizations
 *   **Precomputed Afterstate Buffers:** Caches 4D `(4, 18, 4, 4)` afterstates into the Replay Buffer during environment steps, allowing 100% GPU-vectorized target evaluation.
+*   **`store_only()` for Augmentation:** Augmented experiences are added to the buffer without triggering gradient updates, avoiding 4x learning overhead.
 *   **Vectorized PER SumTree:** Batch sampling via vectorized NumPy masking (`get_batch()`), replacing slow Python loops.
 *   **AMP (Automatic Mixed Precision):** Uses `torch.amp` (FP16) on CUDA to halve VRAM usage.
 *   **MPS Support:** Automatic detection of Apple Metal GPU (M-series chips) for Mac users.
@@ -117,16 +124,22 @@ python training_dqn.py --network-type mlp --no-double-dqn --no-per --n-step 1
 Ep  3,000 | Score:  1285 | AvgTile:  684 | Med:  512 | Std:  210 | ≥256:100% ≥512: 87% ≥1K: 40% ≥2K:  3% | Fail<256:  0% | Loss:4.65 | LR:9.99e-05 | 4.87s
 ```
 
-### Greedy Evaluation (every 1000 episodes, 200 games, no noise)
+### Greedy Evaluation + Early Stopping (every 1000 episodes, 200 games, no noise)
 ```
     ┌─ [EVAL - 200 games, greedy]
     │  Score:  1350 | AvgTile:  720 | Med:  512 | Std:  180
     │  ≥512: 91% | ≥1024: 48% | ≥2048:  6%
+    │  Metric: 31.2 | ★ NEW BEST
     └─ Best: 2048
+```
+If no improvement after `--patience` consecutive evals:
+```
+  ⛔ EARLY STOP at ep 8,000 — no improvement for 5 consecutive evals (5000 episodes)
+     Best eval metric: 31.2
 ```
 
 ### Artifacts Saved (in `./data/` folder)
-1.  **Network Weights:** `dqn_local_*.pth`, `dqn_target_*.pth`. Auto-saves `_best.pth` on new record tile.
+1.  **Network Weights:** `dqn_local_*.pth`, `dqn_target_*.pth`. Auto-saves `_best.pth` on new record tile + `_eval_best.pth` on best EVAL metric.
 2.  **Training State:** `dqn_optimizer_*.pth`, `dqn_state_*.pkl`
 3.  **Visualization:** `*_results.png` (6-panel graph: Score, Max Tile, Reward, Loss, Tile Distribution, Rolling Avg).
 
@@ -135,5 +148,5 @@ Ep  3,000 | Score:  1285 | AvgTile:  684 | Med:  512 | Std:  210 | ≥256:100% �
 ##  Project Structure
 
 *   `game.py`: The 2048 environment logic, including optimized pure-numpy Afterstate calculations and `_CALC_CACHE` for O(1) row operations.
-*   `agent_dqn.py`: Contains `DQNAgent`, `AfterstateValueNetwork`, `NoisyLinear` (with `decay_sigma`), `SumTree` (vectorized `get_batch`), `PrioritizedReplayBuffer`, and `NStepBuffer`.
-*   `training_dqn.py`: Training loop, state encoding, PBRS reward shaping, rotational data augmentation, greedy evaluation, and Matplotlib plotting.
+*   `agent_dqn.py`: Contains `DQNAgent` (with `store_only()`), `AfterstateValueNetwork`, `NoisyLinear` (with `decay_sigma`), `SumTree` (vectorized `get_batch`), `PrioritizedReplayBuffer`, and `NStepBuffer`.
+*   `training_dqn.py`: Training loop, state encoding, PBRS reward shaping, rotational data augmentation, greedy evaluation, early stopping, and Matplotlib plotting.
