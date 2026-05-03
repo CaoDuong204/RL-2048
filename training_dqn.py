@@ -103,7 +103,9 @@ def train(n_episodes=50000,
           lr_schedule=False,
           # Logging
           save_every=1000, print_every=100,
-          save_name='optimized_dqn'):
+          save_name='optimized_dqn',
+          # Early stopping
+          patience=5, min_episodes=3000):
 
     # Memory optimization for afterstate's 5D tensors
     if afterstate and buffer_size > 100000:
@@ -193,10 +195,17 @@ def train(n_episodes=50000,
     best_max_tile = 0
     eps = eps_start
 
+    # --- Early Stopping ---
+    best_eval_metric = 0.0
+    patience_counter = 0
+    early_stop = False
+
     # =====================================================================
     # TRAINING LOOP
     # =====================================================================
     for episode in range(1, n_episodes + 1):
+        if early_stop:
+            break
         t_start = time.time()
         env.reset(2, 0)
         state = transform_fn(env.current_state())
@@ -447,11 +456,32 @@ def train(n_episodes=50000,
             e2048 = sum(1 for t in eval_tiles if t >= 2048) / len(eval_tiles) * 100
             e_best = max(eval_tiles)
             avg_eval = np.mean(eval_scores_list)
+            # Composite metric: 60% weight on ≥1024, 40% on ≥2048
+            eval_metric = e1024 * 0.6 + e2048 * 0.4
+
+            # Early stopping check
+            improved = eval_metric > best_eval_metric + 1.0  # min_delta = 1%
+            if improved:
+                best_eval_metric = eval_metric
+                patience_counter = 0
+                agent.save(f'{save_name}_eval_best')
+                status = "★ NEW BEST"
+            else:
+                patience_counter += 1
+                status = f"no improve ({patience_counter}/{patience})"
+
             print(f"    ┌─ [EVAL - 200 games, greedy]")
             print(f"    │  Score:{avg_eval:7.0f} | "
                   f"AvgTile:{e_avg:5.0f} | Med:{e_med:5d} | Std:{e_std:5.0f}")
             print(f"    │  ≥512:{e512:3.0f}% | ≥1024:{e1024:3.0f}% | ≥2048:{e2048:3.0f}%")
+            print(f"    │  Metric:{eval_metric:5.1f} | {status}")
             print(f"    └─ Best: {e_best}")
+
+            if patience_counter >= patience and episode >= min_episodes:
+                print(f"\n  ⛔ EARLY STOP at ep {episode:,d} — no improvement for "
+                      f"{patience} consecutive evals ({patience * 1000} episodes)")
+                print(f"     Best eval metric: {best_eval_metric:.1f}")
+                early_stop = True
 
     # --- Final ---
     _save_all(agent, save_name, scores, max_tiles,
@@ -459,12 +489,17 @@ def train(n_episodes=50000,
     plot_results(scores, max_tiles, total_rewards, agent.losses,
                  tile_distribution, save_name)
 
+    actual_episodes = len(scores)
     print("=" * 76)
-    print("  TRAINING COMPLETE")
+    if early_stop:
+        print(f"  TRAINING STOPPED EARLY at ep {actual_episodes:,d}/{n_episodes:,d}")
+    else:
+        print("  TRAINING COMPLETE")
     print(f"  Best Score: {best_score:,.0f}  |  Best Tile: {best_max_tile}")
+    print(f"  Best Eval Metric: {best_eval_metric:.1f}")
     for tile in sorted(tile_distribution.keys()):
         count = tile_distribution[tile]
-        pct = count / n_episodes * 100
+        pct = count / actual_episodes * 100 if actual_episodes > 0 else 0
         print(f"    {tile:6d}: {count:6d} ({pct:5.1f}%)")
     print("=" * 76)
 
@@ -612,6 +647,12 @@ if __name__ == '__main__':
     p.add_argument('--print-every', type=int, default=100)
     p.add_argument('--save-name', type=str, default='optimized_dqn')
 
+    # Early stopping
+    p.add_argument('--patience', type=int, default=5,
+                   help='Stop if no EVAL improvement for N consecutive checks (each 1000 ep)')
+    p.add_argument('--min-episodes', type=int, default=3000,
+                   help='Minimum episodes before early stopping can trigger')
+
     args = p.parse_args()
 
     train(
@@ -637,4 +678,6 @@ if __name__ == '__main__':
         save_every=args.save_every,
         print_every=args.print_every,
         save_name=args.save_name,
+        patience=args.patience,
+        min_episodes=args.min_episodes,
     )
