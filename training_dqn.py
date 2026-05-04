@@ -18,7 +18,7 @@ Usage:
 
 import numpy as np
 from game import Game, transform_state_cnn, transform_state_flat
-from agent_dqn import DQNAgent, device
+from agent_dqn import DQNAgent, device, compact_board
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -35,7 +35,7 @@ import argparse
 # =============================================================================
 def get_potential(board):
     """
-    Potential function for Reward Shaping.
+    Potential function for Reward Shaping (fully vectorized — no Python loops).
     Higher potential means a better board state.
     Coefficients reduced by 50% to prevent agent from over-fitting to heuristics
     instead of learning true game value.
@@ -45,41 +45,31 @@ def get_potential(board):
     potential = 0.0
 
     # 1. Corner potential (dynamic: +0.25 * log2(max_tile))
-    corners = [b[0, 0], b[0, 3], b[3, 0], b[3, 3]]
-    if max_val > 0 and max_val == max(corners):
+    corners = b[[0, 0, 3, 3], [0, 3, 0, 3]]
+    if max_val > 0 and max_val == corners.max():
         potential += 0.25 * np.log2(max_val)
 
     # 2. Empty cell potential (+0.04 per empty cell)
-    empty_count = np.sum(b == 0)
-    potential += empty_count * 0.04
+    potential += np.sum(b == 0) * 0.04
 
-    # 3. Monotonicity potential (+0.4 per sorted edge)
+    # 3. Monotonicity potential (+0.4 per sorted row/col) — vectorized
     log_b = np.log2(np.where(b > 0, b, 1))
-    for row in log_b:  # Check ALL rows, not just edges
-        diffs = np.diff(row)
-        if np.all(diffs >= 0) or np.all(diffs <= 0):
-            potential += 0.4
-    for col_idx in range(4):  # Check ALL columns
-        col = log_b[:, col_idx]
-        diffs = np.diff(col)
-        if np.all(diffs >= 0) or np.all(diffs <= 0):
-            potential += 0.4
+    diffs_rows = np.diff(log_b, axis=1)           # (4, 3)
+    mono_rows = np.all(diffs_rows >= 0, axis=1) | np.all(diffs_rows <= 0, axis=1)
+    diffs_cols = np.diff(log_b, axis=0)            # (3, 4)
+    mono_cols = np.all(diffs_cols >= 0, axis=0) | np.all(diffs_cols <= 0, axis=0)
+    potential += (mono_rows.sum() + mono_cols.sum()) * 0.4
 
-    # 4. Smoothness penalty (penalize large differences between adjacent tiles)
-    for i in range(4):
-        for j in range(3):
-            if b[i, j] > 0 and b[i, j+1] > 0:
-                potential -= 0.05 * abs(np.log2(b[i, j]) - np.log2(b[i, j+1]))
-            if b[j, i] > 0 and b[j+1, i] > 0:
-                potential -= 0.05 * abs(np.log2(b[j, i]) - np.log2(b[j+1, i]))
+    # 4. Smoothness penalty — vectorized
+    h_mask = (b[:, :-1] > 0) & (b[:, 1:] > 0)
+    v_mask = (b[:-1, :] > 0) & (b[1:, :] > 0)
+    potential -= 0.05 * (np.sum(np.abs(log_b[:, :-1] - log_b[:, 1:]) * h_mask)
+                       + np.sum(np.abs(log_b[:-1, :] - log_b[1:, :]) * v_mask))
 
-    # 5. Adjacent same-tile potential (snake strategy, halved)
-    for i in range(4):
-        for j in range(3):
-            if b[i, j] > 0 and b[i, j] == b[i, j+1]:
-                potential += 0.1 * np.log2(b[i, j])
-            if b[j, i] > 0 and b[j, i] == b[j+1, i]:
-                potential += 0.1 * np.log2(b[j, i])
+    # 5. Adjacent same-tile potential — vectorized
+    h_same = (b[:, :-1] > 0) & (b[:, :-1] == b[:, 1:])
+    v_same = (b[:-1, :] > 0) & (b[:-1, :] == b[1:, :])
+    potential += 0.1 * (np.sum(log_b[:, :-1] * h_same) + np.sum(log_b[:-1, :] * v_same))
 
     return potential
 
@@ -252,7 +242,6 @@ def train(n_episodes=50000,
 
                 action, merge_reward_val, chosen_astate = valid_actions[
                     best_idx]
-                chosen_astate_encoded = afterstate_tensors[best_idx]
 
                 # Record potential before move
                 phi_s = get_potential(
@@ -262,16 +251,14 @@ def train(n_episodes=50000,
                 env.step(action)
                 done = env.done
 
-                # Precompute next afterstates to save CPU time during ReplayBuffer sample
-                if afterstate:
-                    next_state = np.zeros((4, 18, 4, 4), dtype=np.float32)
-                    if not done:
-                        for a in range(4):
-                            astate, _, is_valid = env.get_afterstate(a)
-                            if is_valid:
-                                next_state[a] = transform_fn(astate.flatten())
-                else:
-                    next_state = transform_fn(env.current_state())
+                # Store compact boards (int8) — skip transform_fn for storage
+                chosen_compact = compact_board(chosen_astate)
+                next_compact = np.zeros((4, 4, 4), dtype=np.int8)
+                if not done:
+                    for a in range(4):
+                        astate, _, is_valid = env.get_afterstate(a)
+                        if is_valid:
+                            next_compact[a] = compact_board(astate)
 
                 # Reward = merge reward from afterstate computation
                 raw_reward = merge_reward_val
@@ -290,27 +277,10 @@ def train(n_episodes=50000,
                 else:
                     reward = raw_reward
 
-                # Store (afterstate, dummy_action, reward, next_afterstates, done)
-                agent.step(chosen_astate_encoded, 0, reward, next_state, done)
+                # Store compact (augmentation now done on GPU during learn)
+                agent.step(chosen_compact, 0, reward, next_compact, done)
 
-                # --- Data Augmentation: 3 rotations (90°, 180°, 270°) ---
-                # Board 2048 has rotational symmetry: V(board) == V(rot(board))
-                # Action permutation: rot k*90° CCW maps action a → action (a+k)%4
-                # in the next_states_4 array, so we permute the action indices.
-                # Uses store_only() to avoid triggering 4x gradient updates.
-                _ROT_PERM = {1: [1, 2, 3, 0], 2: [2, 3, 0, 1], 3: [3, 0, 1, 2]}
-                for k in [1, 2, 3]:
-                    aug_state = np.rot90(chosen_astate_encoded, k=k, axes=(-2, -1)).copy()
-                    perm = _ROT_PERM[k]
-                    aug_next = np.zeros_like(next_state)
-                    for ai in range(4):
-                        aug_next[ai] = np.rot90(next_state[perm[ai]], k=k, axes=(-2, -1))
-                    agent.store_only(aug_state, 0, reward, aug_next, done)
-
-                if afterstate:
-                    state = transform_fn(env.current_state())
-                else:
-                    state = next_state
+                state = transform_fn(env.current_state())
 
             else:
                 # --- Standard Q-learning mode (original logic) ---
@@ -419,13 +389,13 @@ def train(n_episodes=50000,
                       total_rewards, steps_per_episode, tile_distribution)
             print(f"    → Saved at ep {episode:,d}")
 
-        # --- Greedy Evaluation (no noise) every 1000 episodes ---
-        if episode % 1000 == 0:
+        # --- Greedy Evaluation (no noise) every 2000 episodes ---
+        if episode % 2000 == 0:
             eval_tiles = []
             eval_scores_list = []
             was_training = agent.qnetwork_local.training
             agent.qnetwork_local.eval()  # Disables noise in NoisyLinear
-            for _ in range(200):
+            for _ in range(50):
                 eval_env = Game(4, reward_mode='log2', negative_reward=-5, cell_move_penalty=0.1)
                 eval_env.reset(2, 0)
                 while not eval_env.done:
@@ -470,7 +440,7 @@ def train(n_episodes=50000,
                 patience_counter += 1
                 status = f"no improve ({patience_counter}/{patience})"
 
-            print(f"    ┌─ [EVAL - 200 games, greedy]")
+            print(f"    ┌─ [EVAL - 50 games, greedy]")
             print(f"    │  Score:{avg_eval:7.0f} | "
                   f"AvgTile:{e_avg:5.0f} | Med:{e_med:5d} | Std:{e_std:5.0f}")
             print(f"    │  ≥512:{e512:3.0f}% | ≥1024:{e1024:3.0f}% | ≥2048:{e2048:3.0f}%")
@@ -479,7 +449,7 @@ def train(n_episodes=50000,
 
             if patience_counter >= patience and episode >= min_episodes:
                 print(f"\n  ⛔ EARLY STOP at ep {episode:,d} — no improvement for "
-                      f"{patience} consecutive evals ({patience * 1000} episodes)")
+                      f"{patience} consecutive evals ({patience * 2000} episodes)")
                 print(f"     Best eval metric: {best_eval_metric:.1f}")
                 early_stop = True
 

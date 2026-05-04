@@ -32,6 +32,28 @@ import torch.optim as optim
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cuda:0" if torch.cuda.is_available() else "cpu")
 
+
+# =============================================================================
+# Compact Board Storage Helpers
+# =============================================================================
+def compact_board(board_flat_or_2d):
+    """Convert board → (4,4) int8 log2 indices. 72x smaller than one-hot."""
+    board = np.asarray(board_flat_or_2d).reshape(4, 4)
+    result = np.zeros((4, 4), dtype=np.int8)
+    mask = board > 0
+    result[mask] = np.log2(board[mask]).astype(np.int8)
+    return result
+
+
+def expand_states_gpu(compact_tensor):
+    """(B, 4, 4) int/float tensor → (B, 18, 4, 4) one-hot float32 on same device."""
+    idx = compact_tensor.long().unsqueeze(1)       # (B, 1, 4, 4)
+    out = torch.zeros(compact_tensor.size(0), 18, 4, 4,
+                      device=compact_tensor.device, dtype=torch.float32)
+    out.scatter_(1, idx, 1.0)
+    return out
+
+
 # =============================================================================
 # NoisyLinear Layer (Fortunato et al., 2017)
 # =============================================================================
@@ -634,12 +656,6 @@ class DQNAgent:
                 self._sample_and_learn()
 
     # -----------------------------------------------------------------
-    def store_only(self, state, action, reward, next_state, done):
-        """Add experience to buffer WITHOUT triggering learning.
-        Used for data augmentation to avoid 4x gradient update overhead."""
-        self.memory.add(state, action, reward, next_state, done)
-
-    # -----------------------------------------------------------------
     def act(self, state):
         """Return Q-values (or V-value for afterstate mode)."""
         state_t = torch.from_numpy(state).float().unsqueeze(0).to(device)
@@ -657,7 +673,7 @@ class DQNAgent:
 
     # -----------------------------------------------------------------
     def _sample_and_learn(self):
-        """Sample from buffer and learn."""
+        """Sample from buffer and learn. For afterstate: expand compact states + GPU augmentation."""
         if self.noisy_net:
             self.qnetwork_local.reset_noise()
             self.qnetwork_target.reset_noise()
@@ -666,9 +682,36 @@ class DQNAgent:
             return
         experiences, indices, weights = result
         if self.afterstate:
-            self._learn_afterstate(experiences, indices, weights)
+            states, actions, rewards, next_states, dones = experiences
+            # Expand compact (B, 4, 4) → (B, 18, 4, 4) on GPU
+            states = expand_states_gpu(states)
+            # Expand compact (B, 4, 4, 4) → (B, 4, 18, 4, 4)
+            B = states.size(0)
+            next_flat = next_states.reshape(B * 4, 4, 4)
+            next_expanded = expand_states_gpu(next_flat)
+            next_states = next_expanded.reshape(B, 4, 18, 4, 4)
+            # GPU augmentation: 4x batch via rotational symmetry
+            states, next_states, rewards, dones = self._augment_batch_gpu(
+                states, next_states, rewards, dones)
+            if weights is not None:
+                weights = weights.repeat(4, 1)
+            experiences = (states, actions, rewards, next_states, dones)
+            self._learn_afterstate(experiences, indices, weights, orig_batch_size=B)
         else:
             self._learn(experiences, indices, weights)
+
+    # -----------------------------------------------------------------
+    def _augment_batch_gpu(self, states, next_4, rewards, dones):
+        """Augment batch with 3 rotations on GPU. Returns 4x batch size."""
+        _PERM = [[1, 2, 3, 0], [2, 3, 0, 1], [3, 0, 1, 2]]
+        all_s, all_n = [states], [next_4]
+        for k, perm in enumerate(_PERM, 1):
+            all_s.append(torch.rot90(states, k=k, dims=[-2, -1]))
+            rot_n = next_4[:, perm]                        # permute action dim
+            rot_n = torch.rot90(rot_n, k=k, dims=[-2, -1]) # rotate spatial dims
+            all_n.append(rot_n)
+        return (torch.cat(all_s), torch.cat(all_n),
+                rewards.repeat(4, 1), dones.repeat(4, 1))
 
     # -----------------------------------------------------------------
     def _learn(self, experiences, indices=None, weights=None):
@@ -704,21 +747,17 @@ class DQNAgent:
         self.losses.append(loss.item())
 
     # -----------------------------------------------------------------
-    def _learn_afterstate(self, experiences, indices=None, weights=None):
+    def _learn_afterstate(self, experiences, indices=None, weights=None, orig_batch_size=None):
         """
-        Afterstate V-learning update using precomputed next afterstates.
-        
-        V(afterstate) → reward + γ^n * max_a V_target(afterstate(next_state, a))
+        Afterstate V-learning update.
+        Batch may be 4x augmented; orig_batch_size tracks the real PER entries.
         """
         afterstates, _, rewards, next_states_4, dones = experiences
-        # next_states_4 has shape (batch_size, 4, 18, 4, 4) due to precomputation in training_dqn.py
         batch_size = afterstates.size(0)
         
-        # Valid mask: since one-hot encoding means valid states have 1s, an all-zero tensor is invalid.
-        valid_mask = (next_states_4.sum(dim=(-3, -2, -1)) > 0) # shape (batch_size, 4)
+        # Valid mask: one-hot all-zero = invalid afterstate
+        valid_mask = (next_states_4.sum(dim=(-3, -2, -1)) > 0)  # (batch_size, 4)
         
-        # Flatten to (batch_size * 4, 18, 4, 4) to process in one batch
-        # reshape() is safer than view() because the tensor may not be contiguous in memory
         flat_next_states = next_states_4.reshape(batch_size * 4, 18, 4, 4)
         
         with torch.no_grad():
@@ -726,11 +765,7 @@ class DQNAgent:
                 if self.double_dqn:
                     local_vals = self.qnetwork_local(flat_next_states).view(batch_size, 4)
                     target_vals = self.qnetwork_target(flat_next_states).view(batch_size, 4)
-                    
-                    # Mask out invalid actions by giving them -inf so they are never selected
                     local_vals = local_vals.masked_fill(~valid_mask, float('-inf'))
-                    
-                    # Double DQN: local selects best action, target evaluates it
                     best_actions = local_vals.argmax(dim=1, keepdim=True)
                     V_next_max = target_vals.gather(1, best_actions)
                 else:
@@ -738,7 +773,6 @@ class DQNAgent:
                     target_vals = target_vals.masked_fill(~valid_mask, float('-inf'))
                     V_next_max = target_vals.max(dim=1, keepdim=True)[0]
                     
-        # Dones have 0 future value
         V_next_max = V_next_max.masked_fill(dones.bool(), 0.0)
 
         gamma_n = self.gamma ** self.n_step
@@ -754,8 +788,10 @@ class DQNAgent:
 
         self._backward(loss)
 
+        # Only update PER priorities for original (non-augmented) samples
         if indices is not None:
-            self.memory.update_priorities(indices, td_errors.cpu().numpy().flatten())
+            n = orig_batch_size if orig_batch_size else batch_size
+            self.memory.update_priorities(indices, td_errors[:n].cpu().numpy().flatten())
 
         self._soft_update()
         self.learn_step += 1
