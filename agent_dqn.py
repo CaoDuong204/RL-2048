@@ -733,9 +733,9 @@ class DQNAgent:
             Q_expected = self.qnetwork_local(states).gather(1, actions)
             td_errors = (Q_expected - Q_targets).detach().float()
             if weights is not None:
-                loss = (F.mse_loss(Q_expected, Q_targets, reduction='none') * weights).mean()
+                loss = (F.smooth_l1_loss(Q_expected, Q_targets, reduction='none') * weights).mean()
             else:
-                loss = F.mse_loss(Q_expected, Q_targets)
+                loss = F.smooth_l1_loss(Q_expected, Q_targets)
 
         self._backward(loss)
 
@@ -782,9 +782,9 @@ class DQNAgent:
             V_expected = self.qnetwork_local(afterstates)
             td_errors = (V_expected - V_targets).detach().float()
             if weights is not None:
-                loss = (F.mse_loss(V_expected, V_targets, reduction='none') * weights).mean()
+                loss = (F.smooth_l1_loss(V_expected, V_targets, reduction='none') * weights).mean()
             else:
-                loss = F.mse_loss(V_expected, V_targets)
+                loss = F.smooth_l1_loss(V_expected, V_targets)
 
         self._backward(loss)
 
@@ -812,6 +812,9 @@ class DQNAgent:
         for tp, lp in zip(self.qnetwork_target.parameters(),
                           self.qnetwork_local.parameters()):
             tp.data.copy_(self.tau * lp.data + (1.0 - self.tau) * tp.data)
+        # Periodic hard sync for stability (prevents target drift in long training)
+        if self.learn_step % 1000 == 0 and self.learn_step > 0:
+            self._hard_update()
 
     def _hard_update(self):
         for tp, lp in zip(self.qnetwork_target.parameters(),

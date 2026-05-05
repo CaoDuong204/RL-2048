@@ -268,9 +268,11 @@ def train(n_episodes=50000,
                 # PBRS
                 phi_next = 0.0 if done else (
                     get_potential(env.game_board) if reward_shaping else 0.0)
-                # Death penalty: teach agent that dying is catastrophic
+                # Death penalty: teach agent that dying is catastrophic, scaled by max tile
                 if done:
-                    raw_reward -= 10.0
+                    max_tile = env.game_board.max()
+                    death_scale = np.log2(max(max_tile, 2))
+                    raw_reward -= 2.0 * death_scale
 
                 if reward_shaping:
                     reward = raw_reward + (gamma * phi_next) - phi_s
@@ -314,6 +316,12 @@ def train(n_episodes=50000,
                     phi_next = 0.0 if done else (
                         get_potential(
                             env.game_board) if reward_shaping else 0.0)
+                    
+                    if done:
+                        max_tile = env.game_board.max()
+                        death_scale = np.log2(max(max_tile, 2))
+                        raw_reward -= 2.0 * death_scale
+
                     if reward_shaping:
                         reward = raw_reward + (gamma * phi_next) - phi_s
                     else:
